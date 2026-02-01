@@ -1,0 +1,15 @@
+# Core dependencies
+numpy
+Pillow>=9.0.0
+opencv-python>=4.5.0
+torch>=1.10.0
+torchvision>=0.11.0
+
+# YOLO
+ultralytics>=8.0.0
+
+# Optional - for training
+matplotlib>=3.5.0
+
+# Optional - for OCR evaluation
+python-Levenshtein>=0.12.0
