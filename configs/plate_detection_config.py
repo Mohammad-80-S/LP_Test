@@ -5,6 +5,7 @@ from .base_config import BaseConfig
 @dataclass
 class PlateDetectionConfig(BaseConfig):
     """Configuration for WPOD-NET plate detection."""
+    enabled: bool = True
     model_path: str = "weights/wpodnet.pth"
     scale: float = 1
     dim_min: int = 512

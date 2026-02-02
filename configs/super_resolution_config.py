@@ -5,6 +5,8 @@ from .base_config import BaseConfig
 @dataclass
 class SuperResolutionConfig(BaseConfig):
     """Configuration for Super Resolution model."""
+    enabled: bool = True
+    
     # Model architecture
     model_path: str = "weights/super_resolution.pth"
     num_blocks: int = 6
