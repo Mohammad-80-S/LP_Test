@@ -15,105 +15,138 @@ class HistogramNegator:
     
     Analyzes the histogram of an upscaled image to determine if the background
     is darker than the characters. If so, negates the image.
+    
+    Logic:
+    - Find two highest peaks in histogram
+    - The highest peak represents the background (more pixels)
+    - The second highest peak represents the characters
+    - If background peak position < character peak position → dark background → INVERT
+    - If background peak position > character peak position → light background → NO CHANGE
     """
     
     def __init__(self, config: NegationConfig):
         self.config = config
         self.logger = get_logger()
     
-    def _upscale_for_analysis(self, image: Image.Image) -> Image.Image:
+    def _upscale_for_analysis(self, image: np.ndarray) -> np.ndarray:
         """Upscale image using bicubic interpolation for better histogram analysis."""
-        w, h = image.size
+        h, w = image.shape[:2]
         new_w = w * self.config.upscale_factor
         new_h = h * self.config.upscale_factor
-        return image.resize((new_w, new_h), Image.BICUBIC)
+        return cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
     
-    def _compute_grayscale_histogram(self, image: Image.Image) -> np.ndarray:
-        """Compute histogram of grayscale image."""
-        gray = image.convert('L')
-        gray_array = np.array(gray)
-        histogram, _ = np.histogram(gray_array.flatten(), bins=256, range=(0, 256))
-        return histogram
+    def _get_histogram(self, image: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Get grayscale histogram of the image.
+        
+        Returns:
+            Tuple of (histogram, grayscale_image)
+        """
+        if len(image.shape) == 3:
+            gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+        else:
+            gray = image.copy()
+        
+        # Calculate histogram
+        hist = cv2.calcHist([gray], [0], None, [256], [0, 256])
+        hist = hist.flatten()
+        
+        return hist, gray
     
-    def _find_two_peaks(self, histogram: np.ndarray) -> Tuple[int, int]:
+    def _find_two_peaks(self, hist: np.ndarray) -> Tuple[int, int, float, float]:
         """
         Find the two highest peaks in the histogram.
         
         Returns:
-            Tuple of (highest_peak_position, second_highest_peak_position)
+            Tuple of (background_peak_pos, character_peak_pos, background_peak_height, character_peak_height)
+            where background peak is the highest (more pixels) and character peak is second highest
         """
         # Smooth histogram to reduce noise
         kernel_size = 5
         kernel = np.ones(kernel_size) / kernel_size
-        smoothed = np.convolve(histogram, kernel, mode='same')
+        hist_smooth = np.convolve(hist, kernel, mode='same')
         
-        # Find all peaks with minimum distance
+        # Find all peaks
         peaks, properties = find_peaks(
-            smoothed, 
-            distance=self.config.peak_distance,
-            height=np.max(smoothed) * 0.05  # At least 5% of max height
+            hist_smooth, 
+            distance=self.config.peak_distance, 
+            height=0
         )
         
         if len(peaks) < 2:
-            # If less than 2 peaks found, use simple approach
-            # Find global maximum
-            highest_idx = np.argmax(smoothed)
+            # If less than 2 peaks found, use alternative approach
+            # Find the global maximum first
+            peak1_pos = np.argmax(hist_smooth)
+            peak1_height = hist_smooth[peak1_pos]
             
-            # Mask around the highest peak and find second
-            mask_start = max(0, highest_idx - self.config.peak_distance)
-            mask_end = min(256, highest_idx + self.config.peak_distance)
-            smoothed_masked = smoothed.copy()
-            smoothed_masked[mask_start:mask_end] = 0
-            second_idx = np.argmax(smoothed_masked)
+            # Mask the area around the first peak and find second peak
+            hist_masked = hist_smooth.copy()
+            mask_start = max(0, peak1_pos - self.config.peak_distance)
+            mask_end = min(256, peak1_pos + self.config.peak_distance)
+            hist_masked[mask_start:mask_end] = 0
             
-            return highest_idx, second_idx
+            peak2_pos = np.argmax(hist_masked)
+            peak2_height = hist_smooth[peak2_pos]
+            
+            # peak1 is background (highest), peak2 is characters (second highest)
+            return int(peak1_pos), int(peak2_pos), float(peak1_height), float(peak2_height)
         
         # Get peak heights
-        peak_heights = smoothed[peaks]
+        peak_heights = hist_smooth[peaks]
         
         # Sort peaks by height (descending)
         sorted_indices = np.argsort(peak_heights)[::-1]
         
         # Get top 2 peaks
-        highest_peak = peaks[sorted_indices[0]]
-        second_peak = peaks[sorted_indices[1]]
+        # Peak 1 (background) is the highest, Peak 2 (characters) is second highest
+        background_peak_pos = peaks[sorted_indices[0]]
+        character_peak_pos = peaks[sorted_indices[1]]
+        background_peak_height = peak_heights[sorted_indices[0]]
+        character_peak_height = peak_heights[sorted_indices[1]]
         
-        return highest_peak, second_peak
+        return (
+            int(background_peak_pos), 
+            int(character_peak_pos), 
+            float(background_peak_height), 
+            float(character_peak_height)
+        )
     
-    def _should_negate(self, image: Image.Image) -> bool:
+    def _needs_inversion(self, image: np.ndarray) -> Tuple[bool, dict]:
         """
-        Determine if image should be negated based on histogram analysis.
+        Determine if image needs inversion based on histogram analysis.
         
-        If the highest peak (background) is on the left side of the histogram,
-        it means the background is dark and the image should be negated.
+        Logic:
+        - Find two peaks: background (highest) and characters (second highest)
+        - Compare their positions:
+          - If background_peak_pos < character_peak_pos → background is darker → INVERT
+          - If background_peak_pos > character_peak_pos → background is lighter → NO CHANGE
         
         Returns:
-            True if image should be negated, False otherwise
+            Tuple of (needs_inversion, peak_info_dict)
         """
-        histogram = self._compute_grayscale_histogram(image)
-        highest_peak, second_peak = self._find_two_peaks(histogram)
+        hist, gray = self._get_histogram(image)
+        bg_peak_pos, char_peak_pos, bg_peak_height, char_peak_height = self._find_two_peaks(hist)
         
-        self.logger.debug(
-            f"Histogram peaks - Highest (background): {highest_peak}, "
-            f"Second (characters): {second_peak}"
-        )
+        # Background is darker if its peak is to the left of character peak
+        background_is_dark = bg_peak_pos < char_peak_pos
         
-        # If highest peak is on the left (dark), negate
-        # Background should be brighter than characters for proper OCR
-        should_negate = highest_peak < second_peak
+        peak_info = {
+            'background_peak_position': bg_peak_pos,
+            'character_peak_position': char_peak_pos,
+            'background_peak_height': bg_peak_height,
+            'character_peak_height': char_peak_height,
+            'background_is_dark': background_is_dark
+        }
         
-        if should_negate:
-            self.logger.debug("Background is dark, image will be negated")
-        else:
-            self.logger.debug("Background is light, no negation needed")
+        # If background peak is on the left of character peak (darker background)
+        # then we need to invert
+        needs_inversion = background_is_dark
         
-        return should_negate
+        return needs_inversion, peak_info
     
-    def _negate_image(self, image: Image.Image) -> Image.Image:
-        """Negate (invert) the image."""
-        img_array = np.array(image)
-        negated_array = 255 - img_array
-        return Image.fromarray(negated_array)
+    def _invert_image(self, image: np.ndarray) -> np.ndarray:
+        """Invert image colors."""
+        return cv2.bitwise_not(image)
     
     def process(
         self, 
@@ -131,32 +164,51 @@ class HistogramNegator:
         Returns:
             Original size image, negated if background was dark
         """
-        # Load image if path
+        # Load image and convert to numpy array
         if isinstance(image, (str, Path)):
             pil_img = Image.open(image).convert("RGB")
-        elif isinstance(image, np.ndarray):
-            pil_img = Image.fromarray(image)
-        else:
+            img_array = np.array(pil_img)
+        elif isinstance(image, Image.Image):
             pil_img = image.copy()
+            img_array = np.array(pil_img)
+        else:
+            img_array = image.copy()
+            pil_img = Image.fromarray(img_array)
         
-        original_size = pil_img.size
+        original_size = img_array.shape[:2]
         
         # Upscale for histogram analysis
-        upscaled = self._upscale_for_analysis(pil_img)
+        upscaled = self._upscale_for_analysis(img_array)
         
         self.logger.debug(
-            f"Upscaled image from {original_size} to {upscaled.size} for histogram analysis"
+            f"Upscaled image from {original_size} to {upscaled.shape[:2]} for histogram analysis"
         )
         
-        # Determine if negation is needed
-        if self._should_negate(upscaled):
-            # Negate the ORIGINAL image, not the upscaled one
-            result = self._negate_image(pil_img)
-            self.logger.debug("Applied negation to original image")
-        else:
-            result = pil_img
+        # Determine if inversion is needed (analyze upscaled image)
+        needs_inversion, peak_info = self._needs_inversion(upscaled)
         
-        return result
+        self.logger.debug(
+            f"Peak analysis - Background peak: {peak_info['background_peak_position']} "
+            f"(height: {peak_info['background_peak_height']:.0f}), "
+            f"Character peak: {peak_info['character_peak_position']} "
+            f"(height: {peak_info['character_peak_height']:.0f})"
+        )
+        
+        # Apply inversion to ORIGINAL image if needed
+        if needs_inversion:
+            result_array = self._invert_image(img_array)
+            self.logger.debug(
+                f"Applied inversion: background peak ({peak_info['background_peak_position']}) "
+                f"< character peak ({peak_info['character_peak_position']}) → dark background"
+            )
+        else:
+            result_array = img_array
+            self.logger.debug(
+                f"No inversion needed: background peak ({peak_info['background_peak_position']}) "
+                f"> character peak ({peak_info['character_peak_position']}) → light background"
+            )
+        
+        return Image.fromarray(result_array)
     
     def process_batch(
         self, 
@@ -164,3 +216,40 @@ class HistogramNegator:
     ) -> List[Image.Image]:
         """Process multiple images."""
         return [self.process(img) for img in images]
+    
+    def process_with_info(
+        self, 
+        image: Union[Image.Image, np.ndarray, str, Path]
+    ) -> Tuple[Image.Image, bool, dict]:
+        """
+        Process image and return additional info.
+        
+        Args:
+            image: Input image
+            
+        Returns:
+            Tuple of (processed_image, was_inverted, peak_info)
+        """
+        # Load image and convert to numpy array
+        if isinstance(image, (str, Path)):
+            pil_img = Image.open(image).convert("RGB")
+            img_array = np.array(pil_img)
+        elif isinstance(image, Image.Image):
+            pil_img = image.copy()
+            img_array = np.array(pil_img)
+        else:
+            img_array = image.copy()
+        
+        # Upscale for histogram analysis
+        upscaled = self._upscale_for_analysis(img_array)
+        
+        # Determine if inversion is needed
+        needs_inversion, peak_info = self._needs_inversion(upscaled)
+        
+        # Apply inversion to ORIGINAL image if needed
+        if needs_inversion:
+            result_array = self._invert_image(img_array)
+        else:
+            result_array = img_array
+        
+        return Image.fromarray(result_array), needs_inversion, peak_info
