@@ -1,14 +1,19 @@
 from dataclasses import dataclass
-from typing import Dict
+from typing import Dict, Optional
 from .base_config import BaseConfig
 
 
 @dataclass
 class OCRConfig(BaseConfig):
     """Configuration for YOLOv8 OCR."""
+    enabled: bool = True
     model_path: str = "weights/ocr_model.pt"
     confidence_threshold: float = 0.5
     output_subdir: str = "05_ocr"
+    
+    # Character limit - stop after this many characters from left
+    max_characters: int = 8
+    limit_characters: bool = True  # Enable/disable character limiting
     
     # Class mapping for Persian license plates
     class_mapping: Dict[str, str] = None

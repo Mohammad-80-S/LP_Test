@@ -14,6 +14,9 @@ Usage:
     
     # Enable debug mode
     python run.py --input image.jpg --debug
+    
+    # Disable specific stages
+    python run.py --input image.jpg --disable-negation --disable-histogram
 """
 
 import argparse
@@ -25,6 +28,7 @@ from configs import (
     CarDetectionConfig,
     PlateDetectionConfig,
     HistogramConfig,
+    NegationConfig,
     SuperResolutionConfig,
     OCRConfig,
 )
@@ -41,6 +45,8 @@ Examples:
   python run.py --input folder/ --output results/
   python run.py --input plate.jpg --start-stage histogram --end-stage ocr
   python run.py --input image.jpg --debug
+  python run.py --input image.jpg --disable-negation
+  python run.py --input image.jpg --disable-histogram --disable-negation
         """
     )
     
@@ -63,15 +69,60 @@ Examples:
         "--start-stage",
         type=str,
         default="car_detection",
-        choices=["car_detection", "plate_detection", "histogram", "super_resolution", "ocr"],
+        choices=["car_detection", "plate_detection", "histogram", "negation", "super_resolution", "ocr"],
         help="Starting stage of the pipeline (default: car_detection)"
     )
     parser.add_argument(
         "--end-stage",
         type=str,
         default="ocr",
-        choices=["car_detection", "plate_detection", "histogram", "super_resolution", "ocr"],
+        choices=["car_detection", "plate_detection", "histogram", "negation", "super_resolution", "ocr"],
         help="Ending stage of the pipeline (default: ocr)"
+    )
+    
+    # Stage enable/disable options
+    parser.add_argument(
+        "--disable-car-detection",
+        action="store_true",
+        help="Disable car detection stage"
+    )
+    parser.add_argument(
+        "--disable-plate-detection",
+        action="store_true",
+        help="Disable plate detection stage"
+    )
+    parser.add_argument(
+        "--disable-histogram",
+        action="store_true",
+        help="Disable histogram equalization stage"
+    )
+    parser.add_argument(
+        "--disable-negation",
+        action="store_true",
+        help="Disable histogram-based negation stage"
+    )
+    parser.add_argument(
+        "--disable-super-resolution",
+        action="store_true",
+        help="Disable super resolution stage"
+    )
+    parser.add_argument(
+        "--disable-ocr",
+        action="store_true",
+        help="Disable OCR stage"
+    )
+    
+    # OCR options
+    parser.add_argument(
+        "--max-characters",
+        type=int,
+        default=8,
+        help="Maximum number of characters to recognize (default: 8)"
+    )
+    parser.add_argument(
+        "--no-character-limit",
+        action="store_true",
+        help="Disable character limiting in OCR"
     )
     
     # Debug options
@@ -142,24 +193,33 @@ Examples:
 def create_config(args) -> PipelineConfig:
     """Create pipeline configuration from arguments."""
     
-    # Create sub-configs
+    # Create sub-configs with enabled flags
     car_config = CarDetectionConfig(
+        enabled=not args.disable_car_detection,
         model_path=args.car_model,
         device=args.device,
         debug=args.debug,
     )
     
     plate_config = PlateDetectionConfig(
+        enabled=not args.disable_plate_detection,
         model_path=args.plate_model,
         device=args.device,
         debug=args.debug,
     )
     
     histogram_config = HistogramConfig(
+        enabled=not args.disable_histogram,
+        debug=args.debug,
+    )
+    
+    negation_config = NegationConfig(
+        enabled=not args.disable_negation,
         debug=args.debug,
     )
     
     sr_config = SuperResolutionConfig(
+        enabled=not args.disable_super_resolution,
         model_path=args.sr_model,
         device=args.device,
         debug=args.debug,
@@ -167,9 +227,12 @@ def create_config(args) -> PipelineConfig:
     )
     
     ocr_config = OCRConfig(
+        enabled=not args.disable_ocr,
         model_path=args.ocr_model,
         device=args.device,
         debug=args.debug,
+        max_characters=args.max_characters,
+        limit_characters=not args.no_character_limit,
     )
     
     # Main config
@@ -185,6 +248,7 @@ def create_config(args) -> PipelineConfig:
         car_detection=car_config,
         plate_detection=plate_config,
         histogram=histogram_config,
+        negation=negation_config,
         super_resolution=sr_config,
         ocr=ocr_config,
     )

@@ -11,6 +11,7 @@ from modules import (
     CarDetector,
     PlateDetector,
     HistogramEqualizer,
+    HistogramNegator,
     SuperResolutionInference,
     OCRRecognizer,
 )
@@ -45,6 +46,7 @@ class LPRPipeline:
         "car_detection",
         "plate_detection",
         "histogram",
+        "negation",
         "super_resolution",
         "ocr"
     ]
@@ -82,6 +84,9 @@ class LPRPipeline:
         
         if "histogram" in self.active_stages:
             self.modules["histogram"] = HistogramEqualizer(self.config.histogram)
+        
+        if "negation" in self.active_stages:
+            self.modules["negation"] = HistogramNegator(self.config.negation)
         
         if "super_resolution" in self.active_stages:
             self.modules["super_resolution"] = SuperResolutionInference(self.config.super_resolution)
@@ -192,6 +197,21 @@ class LPRPipeline:
             
             current_images = equalized
             self.logger.stage_end("Histogram Equalization")
+        
+        # Negation (after histogram equalization)
+        if "negation" in self.active_stages:
+            self.logger.stage_start("Histogram-based Negation")
+            negator = self.modules["negation"]
+            
+            processed = []
+            for img in current_images:
+                neg = negator.process(img)
+                processed.append(neg)
+                if self.debug_dir:
+                    intermediate.setdefault("negation", []).append(neg)
+            
+            current_images = processed
+            self.logger.stage_end("Histogram-based Negation")
         
         # Super Resolution
         if "super_resolution" in self.active_stages:

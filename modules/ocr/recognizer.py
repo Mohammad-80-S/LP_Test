@@ -78,16 +78,25 @@ class OCRRecognizer:
             xmin, ymin, xmax, ymax, conf, cls_idx = det
             class_name = self.model.names[int(cls_idx)]
             
-            characters.append((xmin, class_name))
-            details.append({
+            characters.append((xmin, class_name, {
                 'class': class_name,
                 'confidence': float(conf),
                 'bbox': [float(xmin), float(ymin), float(xmax), float(ymax)]
-            })
+            }))
         
         # Sort by x position (left to right)
         characters.sort(key=lambda x: x[0])
+        
+        # Apply character limit if enabled
+        if self.config.limit_characters and len(characters) > self.config.max_characters:
+            self.logger.debug(
+                f"Limiting characters from {len(characters)} to {self.config.max_characters}"
+            )
+            characters = characters[:self.config.max_characters]
+        
+        # Extract text and details
         text = "".join([char[1] for char in characters])
+        details = [char[2] for char in characters]
         
         return text, details
     
