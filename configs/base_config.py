@@ -21,7 +21,7 @@ class PipelineConfig(BaseConfig):
     save_intermediate: bool = True
     
     # Pipeline stages to run
-    start_stage: str = "car_detection"  # Options: car_detection, plate_detection, histogram, negation, super_resolution, ocr
+    start_stage: str = "car_detection"  # Options: car_detection, plate_detection, histogram, super_resolution, ocr
     end_stage: str = "ocr"
     
     # Input/Output settings
@@ -35,16 +35,15 @@ class PipelineConfig(BaseConfig):
     car_detection: Optional["CarDetectionConfig"] = None
     plate_detection: Optional["PlateDetectionConfig"] = None
     histogram: Optional["HistogramConfig"] = None
-    negation: Optional["NegationConfig"] = None
+    negation: Optional["NegationConfig"] = None  # Negation is integrated with SR
     super_resolution: Optional["SuperResolutionConfig"] = None
     ocr: Optional["OCRConfig"] = None
     
-    # Supported stages in order
+    # Supported stages in order (negation is not a separate stage, it's part of SR)
     STAGES: List[str] = field(default_factory=lambda: [
         "car_detection",
         "plate_detection", 
         "histogram",
-        "negation",
         "super_resolution",
         "ocr"
     ])
@@ -83,7 +82,6 @@ class PipelineConfig(BaseConfig):
                 "car_detection": self.car_detection,
                 "plate_detection": self.plate_detection,
                 "histogram": self.histogram,
-                "negation": self.negation,
                 "super_resolution": self.super_resolution,
                 "ocr": self.ocr,
             }

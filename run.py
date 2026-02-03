@@ -69,14 +69,14 @@ Examples:
         "--start-stage",
         type=str,
         default="car_detection",
-        choices=["car_detection", "plate_detection", "histogram", "negation", "super_resolution", "ocr"],
+        choices=["car_detection", "plate_detection", "histogram", "super_resolution", "ocr"],
         help="Starting stage of the pipeline (default: car_detection)"
     )
     parser.add_argument(
         "--end-stage",
         type=str,
         default="ocr",
-        choices=["car_detection", "plate_detection", "histogram", "negation", "super_resolution", "ocr"],
+        choices=["car_detection", "plate_detection", "histogram", "super_resolution", "ocr"],
         help="Ending stage of the pipeline (default: ocr)"
     )
     
@@ -99,7 +99,7 @@ Examples:
     parser.add_argument(
         "--disable-negation",
         action="store_true",
-        help="Disable histogram-based negation stage"
+        help="Disable histogram-based negation (applied before SR)"
     )
     parser.add_argument(
         "--disable-super-resolution",
@@ -110,6 +110,19 @@ Examples:
         "--disable-ocr",
         action="store_true",
         help="Disable OCR stage"
+    )
+    
+    # Negation options
+    parser.add_argument(
+        "--negation-scale",
+        type=int,
+        default=8,
+        help="Scale factor for upscaling before negation analysis (default: 8)"
+    )
+    parser.add_argument(
+        "--no-negation-visualization",
+        action="store_true",
+        help="Disable saving negation visualization images"
     )
     
     # OCR options
@@ -215,6 +228,8 @@ def create_config(args) -> PipelineConfig:
     
     negation_config = NegationConfig(
         enabled=not args.disable_negation,
+        scale_factor=args.negation_scale,
+        save_visualization=not args.no_negation_visualization,
         debug=args.debug,
     )
     
@@ -277,6 +292,11 @@ def main():
         print(f"\nImage: {result.image_path}")
         print(f"  Cars detected: {result.cars_detected}")
         print(f"  Plates detected: {result.plates_detected}")
+        
+        if result.negation_applied:
+            for i, was_negated in enumerate(result.negation_applied):
+                status = "Yes" if was_negated else "No"
+                print(f"  Plate {i+1} negation applied: {status}")
         
         if result.recognized_texts:
             print(f"  Recognized plates:")

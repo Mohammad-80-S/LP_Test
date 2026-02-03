@@ -27,6 +27,7 @@ class PipelineResult:
     recognized_texts: List[str] = None
     details: List[Dict[str, Any]] = None
     intermediate_images: Dict[str, List[Image.Image]] = None
+    negation_applied: List[bool] = None  # Track which plates were negated
     
     def __post_init__(self):
         if self.plate_sizes is None:
@@ -37,6 +38,8 @@ class PipelineResult:
             self.details = []
         if self.intermediate_images is None:
             self.intermediate_images = {}
+        if self.negation_applied is None:
+            self.negation_applied = []
 
 
 class LPRPipeline:
@@ -46,8 +49,7 @@ class LPRPipeline:
         "car_detection",
         "plate_detection",
         "histogram",
-        "negation",
-        "super_resolution",
+        "super_resolution",  # Negation is integrated within SR stage
         "ocr"
     ]
     
@@ -85,11 +87,11 @@ class LPRPipeline:
         if "histogram" in self.active_stages:
             self.modules["histogram"] = HistogramEqualizer(self.config.histogram)
         
-        if "negation" in self.active_stages:
-            self.modules["negation"] = HistogramNegator(self.config.negation)
-        
         if "super_resolution" in self.active_stages:
             self.modules["super_resolution"] = SuperResolutionInference(self.config.super_resolution)
+            # Initialize negation module if enabled (used within SR stage)
+            if self.config.negation.enabled:
+                self.modules["negation"] = HistogramNegator(self.config.negation)
         
         if "ocr" in self.active_stages:
             self.modules["ocr"] = OCRRecognizer(self.config.ocr)
@@ -138,6 +140,9 @@ class LPRPipeline:
         
         # Starting images
         current_images = [image]
+        
+        # Get base name for saving debug images
+        base_name = Path(image_name).stem
         
         # Car Detection
         if "car_detection" in self.active_stages:
@@ -198,32 +203,52 @@ class LPRPipeline:
             current_images = equalized
             self.logger.stage_end("Histogram Equalization")
         
-        # Negation (after histogram equalization)
-        if "negation" in self.active_stages:
-            self.logger.stage_start("Histogram-based Negation")
-            negator = self.modules["negation"]
-            
-            processed = []
-            for img in current_images:
-                neg = negator.process(img)
-                processed.append(neg)
-                if self.debug_dir:
-                    intermediate.setdefault("negation", []).append(neg)
-            
-            current_images = processed
-            self.logger.stage_end("Histogram-based Negation")
-        
-        # Super Resolution
+        # Super Resolution (with integrated Negation)
         if "super_resolution" in self.active_stages:
             self.logger.stage_start("Super Resolution")
             sr_module = self.modules["super_resolution"]
+            negation_module = self.modules.get("negation")
             
             enhanced = []
+            negation_applied_list = []
+            
             for idx, img in enumerate(current_images):
                 original_size = img.size
                 
                 # Check if SR should be applied based on size threshold
                 if sr_module.should_apply(img):
+                    self.logger.debug(f"  Plate {idx+1}: Size {original_size} below threshold, applying SR pipeline")
+                    
+                    # Apply Negation BEFORE Super Resolution (only if SR will be applied)
+                    if negation_module is not None and self.config.negation.enabled:
+                        self.logger.debug(f"  Plate {idx+1}: Checking if negation is needed")
+                        
+                        # Setup save directory for negation visualization
+                        neg_save_dir = None
+                        if self.debug_dir and self.config.negation.save_visualization:
+                            neg_save_dir = self.debug_dir / "03b_negation"
+                            neg_save_dir.mkdir(parents=True, exist_ok=True)
+                        
+                        # Process with negation
+                        img_after_neg, was_inverted, neg_details = negation_module.process_with_info(
+                            img,
+                            save_dir=neg_save_dir,
+                            image_name=f"{base_name}_plate_{idx}"
+                        )
+                        
+                        negation_applied_list.append(was_inverted)
+                        
+                        if was_inverted:
+                            self.logger.debug(f"  Plate {idx+1}: Negation applied (dark background detected)")
+                            if self.debug_dir:
+                                intermediate.setdefault("negation", []).append(img_after_neg)
+                        else:
+                            self.logger.debug(f"  Plate {idx+1}: No negation needed (light background)")
+                        
+                        img = img_after_neg
+                    else:
+                        negation_applied_list.append(False)
+                    
                     # Apply SR (automatically resizes to training size first)
                     sr_img = sr_module.enhance_simple(img)
                     enhanced.append(sr_img)
@@ -237,11 +262,13 @@ class LPRPipeline:
                     if self.debug_dir:
                         intermediate.setdefault("super_resolution", []).append(sr_img)
                 else:
-                    # Image is large enough, skip SR
+                    # Image is large enough, skip SR (and negation since they're coupled)
                     enhanced.append(img)
-                    self.logger.debug(f"  Plate {idx+1}: Skipped SR (size {original_size} above threshold)")
+                    negation_applied_list.append(False)
+                    self.logger.debug(f"  Plate {idx+1}: Skipped SR and negation (size {original_size} above threshold)")
             
             current_images = enhanced
+            result.negation_applied = negation_applied_list
             self.logger.stage_end("Super Resolution")
         
         # OCR
