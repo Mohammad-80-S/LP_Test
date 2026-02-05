@@ -4,15 +4,20 @@ Evaluate OCR accuracy on:
   2) Super-Resolution model outputs
 
 Metrics: character-level accuracy using Levenshtein distance.
+Includes confusion matrix generation for OCR character predictions.
 """
 
 import os
 import glob
 from pathlib import Path
 import xml.etree.ElementTree as ET
+from collections import defaultdict
 
 from PIL import Image
 import Levenshtein
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 from configs import SuperResolutionConfig, OCRConfig
 from modules.super_resolution import SuperResolutionInference
@@ -72,6 +77,194 @@ def calculate_character_accuracy(gt_string: str, pred_string: str) -> float:
     return max(0.0, acc)
 
 
+def align_strings_for_confusion(gt_string: str, pred_string: str):
+    """
+    Align ground truth and predicted strings character by character.
+    Uses simple alignment based on Levenshtein operations.
+    Returns list of (gt_char, pred_char) tuples.
+    """
+    alignments = []
+    
+    if not gt_string and not pred_string:
+        return alignments
+    
+    if not gt_string:
+        # All predictions are false positives
+        for p in pred_string:
+            alignments.append(("", p))
+        return alignments
+    
+    if not pred_string:
+        # All ground truth are missed
+        for g in gt_string:
+            alignments.append((g, ""))
+        return alignments
+    
+    # Use dynamic programming for alignment
+    m, n = len(gt_string), len(pred_string)
+    dp = [[0] * (n + 1) for _ in range(m + 1)]
+    
+    for i in range(m + 1):
+        dp[i][0] = i
+    for j in range(n + 1):
+        dp[0][j] = j
+    
+    for i in range(1, m + 1):
+        for j in range(1, n + 1):
+            if gt_string[i-1] == pred_string[j-1]:
+                dp[i][j] = dp[i-1][j-1]
+            else:
+                dp[i][j] = 1 + min(dp[i-1][j], dp[i][j-1], dp[i-1][j-1])
+    
+    # Backtrack to find alignment
+    i, j = m, n
+    aligned_pairs = []
+    
+    while i > 0 or j > 0:
+        if i > 0 and j > 0 and gt_string[i-1] == pred_string[j-1]:
+            aligned_pairs.append((gt_string[i-1], pred_string[j-1]))
+            i -= 1
+            j -= 1
+        elif i > 0 and j > 0 and dp[i][j] == dp[i-1][j-1] + 1:
+            # Substitution
+            aligned_pairs.append((gt_string[i-1], pred_string[j-1]))
+            i -= 1
+            j -= 1
+        elif j > 0 and dp[i][j] == dp[i][j-1] + 1:
+            # Insertion in prediction
+            aligned_pairs.append(("", pred_string[j-1]))
+            j -= 1
+        elif i > 0 and dp[i][j] == dp[i-1][j] + 1:
+            # Deletion (missed in prediction)
+            aligned_pairs.append((gt_string[i-1], ""))
+            i -= 1
+        else:
+            # Fallback
+            if j > 0:
+                aligned_pairs.append(("", pred_string[j-1]))
+                j -= 1
+            elif i > 0:
+                aligned_pairs.append((gt_string[i-1], ""))
+                i -= 1
+    
+    aligned_pairs.reverse()
+    return aligned_pairs
+
+
+class ConfusionMatrixBuilder:
+    """Build and visualize confusion matrix for OCR characters."""
+    
+    def __init__(self, name: str = "OCR"):
+        self.name = name
+        self.confusion_counts = defaultdict(lambda: defaultdict(int))
+        self.all_chars = set()
+    
+    def add_prediction(self, gt_string: str, pred_string: str):
+        """Add a prediction pair to the confusion matrix."""
+        gt_normalized = normalize_characters(gt_string) if gt_string else ""
+        pred_normalized = normalize_characters(pred_string) if pred_string else ""
+        
+        alignments = align_strings_for_confusion(gt_normalized, pred_normalized)
+        
+        for gt_char, pred_char in alignments:
+            if gt_char:  # Only count if there's a ground truth character
+                self.confusion_counts[gt_char][pred_char if pred_char else "<MISS>"] += 1
+                self.all_chars.add(gt_char)
+                if pred_char:
+                    self.all_chars.add(pred_char)
+    
+    def build_matrix(self):
+        """Build the confusion matrix as numpy array."""
+        # Sort characters: digits first, then letters
+        chars = sorted(self.all_chars, key=lambda x: (not x.isdigit(), x))
+        chars_with_miss = chars + ["<MISS>"]
+        
+        n_gt = len(chars)
+        n_pred = len(chars_with_miss)
+        
+        matrix = np.zeros((n_gt, n_pred), dtype=int)
+        
+        for i, gt_char in enumerate(chars):
+            for j, pred_char in enumerate(chars_with_miss):
+                matrix[i, j] = self.confusion_counts[gt_char][pred_char]
+        
+        return matrix, chars, chars_with_miss
+    
+    def plot_and_save(self, save_path: str, figsize: tuple = None):
+        """Plot confusion matrix and save as image."""
+        matrix, gt_labels, pred_labels = self.build_matrix()
+        
+        if len(gt_labels) == 0:
+            print(f"Warning: No data to plot for {self.name} confusion matrix")
+            return
+        
+        # Determine figure size based on matrix size
+        if figsize is None:
+            n_labels = max(len(gt_labels), len(pred_labels))
+            figsize = (max(12, n_labels * 0.5), max(10, len(gt_labels) * 0.5))
+        
+        fig, ax = plt.subplots(figsize=figsize)
+        
+        # Create heatmap
+        sns.heatmap(
+            matrix,
+            annot=True,
+            fmt='d',
+            cmap='Blues',
+            xticklabels=pred_labels,
+            yticklabels=gt_labels,
+            ax=ax,
+            cbar_kws={'label': 'Count'}
+        )
+        
+        ax.set_xlabel('Predicted Character', fontsize=12)
+        ax.set_ylabel('Ground Truth Character', fontsize=12)
+        ax.set_title(f'Confusion Matrix - {self.name}', fontsize=14)
+        
+        # Rotate x labels for better readability
+        plt.xticks(rotation=45, ha='right')
+        plt.yticks(rotation=0)
+        
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        
+        print(f"Confusion matrix saved: {save_path}")
+    
+    def print_summary(self):
+        """Print summary statistics from confusion matrix."""
+        matrix, gt_labels, pred_labels = self.build_matrix()
+        
+        if len(gt_labels) == 0:
+            print(f"No data for {self.name}")
+            return
+        
+        # Calculate per-character accuracy
+        print(f"\n{self.name} - Per-character accuracy:")
+        print("-" * 40)
+        
+        total_correct = 0
+        total_count = 0
+        
+        for i, gt_char in enumerate(gt_labels):
+            row_sum = matrix[i, :].sum()
+            if row_sum > 0:
+                # Find correct predictions (diagonal)
+                if gt_char in pred_labels:
+                    correct_idx = pred_labels.index(gt_char)
+                    correct = matrix[i, correct_idx]
+                else:
+                    correct = 0
+                accuracy = correct / row_sum * 100
+                total_correct += correct
+                total_count += row_sum
+                print(f"  '{gt_char}': {correct}/{row_sum} ({accuracy:.1f}%)")
+        
+        if total_count > 0:
+            overall_acc = total_correct / total_count * 100
+            print(f"\n  Overall: {total_correct}/{total_count} ({overall_acc:.1f}%)")
+
+
 def main():
     import argparse
 
@@ -121,11 +314,19 @@ def main():
         choices=["cuda", "cpu"],
         help="Device to use",
     )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default="eval_results",
+        help="Directory to save confusion matrix images (default: eval_results)",
+    )
     args = parser.parse_args()
 
     lr_dir = Path(args.lr_dir)
     hr_dir = Path(args.hr_dir)
     xml_dir = Path(args.xml_dir)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     # --- Set up SR inference (force apply to all images) ---
     sr_config = SuperResolutionConfig(
@@ -157,6 +358,11 @@ def main():
         return
 
     print(f"Found {len(image_paths)} LR images.")
+
+    # Initialize confusion matrix builders
+    cm_hr = ConfusionMatrixBuilder(name="HR (High Resolution)")
+    cm_bicubic = ConfusionMatrixBuilder(name="Bicubic Upsampling")
+    cm_sr = ConfusionMatrixBuilder(name="Super Resolution")
 
     bicubic_accuracies = []
     hr_accuracies = []
@@ -211,6 +417,11 @@ def main():
         bicubic_pred_normalized = normalize_characters(bicubic_pred)
         sr_pred_normalized = normalize_characters(sr_pred)
 
+        # --- Add to confusion matrices ---
+        cm_hr.add_prediction(gt_string, hr_pred)
+        cm_bicubic.add_prediction(gt_string, bicubic_pred)
+        cm_sr.add_prediction(gt_string, sr_pred)
+
         # --- Calculate accuracies using normalized strings ---
         bicubic_acc = calculate_character_accuracy(gt_string_normalized, bicubic_pred_normalized)
         bicubic_accuracies.append(bicubic_acc)
@@ -246,6 +457,63 @@ def main():
         print(f"Perfect plates (acc>0.99) Bicubic: {bicubic_perfect}")
         print(f"Perfect plates (acc>0.99) SR:      {sr_perfect}")
         print("=" * 40)
+        
+        # --- Generate and save confusion matrices ---
+        print("\n" + "=" * 40)
+        print("GENERATING CONFUSION MATRICES")
+        print("=" * 40)
+        
+        # Save confusion matrix images
+        cm_hr.plot_and_save(str(output_dir / "confusion_matrix_hr.png"))
+        cm_bicubic.plot_and_save(str(output_dir / "confusion_matrix_bicubic.png"))
+        cm_sr.plot_and_save(str(output_dir / "confusion_matrix_sr.png"))
+        
+        # Print per-character summaries
+        cm_hr.print_summary()
+        cm_bicubic.print_summary()
+        cm_sr.print_summary()
+        
+        # Display confusion matrices
+        print("\n" + "=" * 40)
+        print("DISPLAYING CONFUSION MATRICES")
+        print("=" * 40)
+        
+        # Create a combined figure for display
+        fig, axes = plt.subplots(1, 3, figsize=(24, 8))
+        
+        for idx, (cm, ax, title) in enumerate([
+            (cm_hr, axes[0], "HR (High Resolution)"),
+            (cm_bicubic, axes[1], "Bicubic Upsampling"),
+            (cm_sr, axes[2], "Super Resolution")
+        ]):
+            matrix, gt_labels, pred_labels = cm.build_matrix()
+            if len(gt_labels) > 0:
+                sns.heatmap(
+                    matrix,
+                    annot=True,
+                    fmt='d',
+                    cmap='Blues',
+                    xticklabels=pred_labels,
+                    yticklabels=gt_labels,
+                    ax=ax,
+                    cbar_kws={'label': 'Count'}
+                )
+                ax.set_xlabel('Predicted Character', fontsize=10)
+                ax.set_ylabel('Ground Truth Character', fontsize=10)
+                ax.set_title(f'Confusion Matrix - {title}', fontsize=12)
+                ax.tick_params(axis='x', rotation=45)
+            else:
+                ax.text(0.5, 0.5, 'No Data', ha='center', va='center', fontsize=14)
+                ax.set_title(f'Confusion Matrix - {title}', fontsize=12)
+        
+        plt.tight_layout()
+        combined_path = output_dir / "confusion_matrix_combined.png"
+        plt.savefig(str(combined_path), dpi=150, bbox_inches='tight')
+        print(f"Combined confusion matrix saved: {combined_path}")
+        
+        # Show the plot
+        plt.show()
+        
     else:
         print("\nNo images were evaluated.")
         
