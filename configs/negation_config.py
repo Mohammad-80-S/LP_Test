@@ -5,8 +5,8 @@ from .base_config import BaseConfig
 @dataclass
 class NegationConfig(BaseConfig):
     """Configuration for histogram-based negation."""
-    enabled: bool = True
-    scale_factor: int = 8  # Factor to upscale for histogram analysis
+    enabled: bool = False
+    scale_factor: int = 2  # Factor to upscale for histogram analysis
     gaussian_window_size: int = 15  # Window size for Gaussian smoothing
     gaussian_std_dev: float = 3.0  # Standard deviation for Gaussian smoothing
     peak_distance: int = 40  # Minimum distance between peaks
