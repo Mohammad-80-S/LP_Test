@@ -12,6 +12,7 @@ import glob
 from pathlib import Path
 import xml.etree.ElementTree as ET
 from collections import defaultdict
+import re
 
 from PIL import Image
 import Levenshtein
@@ -24,6 +25,45 @@ from modules.super_resolution import SuperResolutionInference
 from modules.ocr import OCRRecognizer
 
 
+# Define multi-character tokens that should be treated as single units
+MULTI_CHAR_TOKENS = ["Ein", "Gh", "Sad", "Sin", "Ta", "Zh"]
+
+
+def tokenize_plate_string(text: str) -> list:
+    """
+    Tokenize a plate string into individual tokens.
+    Multi-character class names (Ein, Gh, Sad, Sin, Ta, Zh) are treated as single tokens.
+    
+    Args:
+        text: The plate string (e.g., "12Ein45Gh7")
+    
+    Returns:
+        List of tokens (e.g., ["1", "2", "Ein", "4", "5", "Gh", "7"])
+    """
+    if not text:
+        return []
+    
+    tokens = []
+    i = 0
+    
+    while i < len(text):
+        matched = False
+        # Check for multi-character tokens (longest match first)
+        for token in sorted(MULTI_CHAR_TOKENS, key=len, reverse=True):
+            if text[i:].startswith(token):
+                tokens.append(token)
+                i += len(token)
+                matched = True
+                break
+        
+        if not matched:
+            # Single character token
+            tokens.append(text[i])
+            i += 1
+    
+    return tokens
+
+
 def normalize_characters(text: str) -> str:
     """
     Normalize characters for comparison.
@@ -32,6 +72,15 @@ def normalize_characters(text: str) -> str:
     if text is None:
         return None
     return text.replace("2", "2")
+
+
+def normalize_tokens(tokens: list) -> list:
+    """
+    Normalize tokens for comparison.
+    """
+    if not tokens:
+        return []
+    return [normalize_characters(t) for t in tokens]
 
 
 def parse_xml_to_string(xml_path: Path, class_mapping) -> str | None:
@@ -64,6 +113,36 @@ def parse_xml_to_string(xml_path: Path, class_mapping) -> str | None:
     return "".join([c[1] for c in characters])
 
 
+def parse_xml_to_tokens(xml_path: Path, class_mapping) -> list | None:
+    """
+    Parses a PASCAL VOC XML file, sorts characters by their horizontal position,
+    and returns the corresponding license plate as a list of tokens.
+    """
+    if not xml_path.exists():
+        return None
+
+    tree = ET.parse(str(xml_path))
+    root = tree.getroot()
+
+    characters = []
+    for obj in root.findall("object"):
+        class_name = obj.find("name").text
+        xmin = int(obj.find("bndbox/xmin").text)
+
+        mapped_name = class_mapping.get(class_name)
+        if mapped_name is None:
+            print(f"Warning: Class '{class_name}' in {xml_path} not in CLASS_MAPPING. Skipping this char.")
+            continue
+
+        characters.append((xmin, mapped_name))
+
+    if not characters:
+        return []
+
+    characters.sort(key=lambda x: x[0])
+    return [c[1] for c in characters]
+
+
 def calculate_character_accuracy(gt_string: str, pred_string: str) -> float:
     """
     Character-level accuracy using Levenshtein distance:
@@ -77,31 +156,54 @@ def calculate_character_accuracy(gt_string: str, pred_string: str) -> float:
     return max(0.0, acc)
 
 
-def align_strings_for_confusion(gt_string: str, pred_string: str):
+def calculate_token_accuracy(gt_tokens: list, pred_tokens: list) -> float:
     """
-    Align ground truth and predicted strings character by character.
-    Uses simple alignment based on Levenshtein operations.
-    Returns list of (gt_char, pred_char) tuples.
+    Token-level accuracy using Levenshtein distance on token lists.
+    """
+    if not gt_tokens:
+        return 0.0 if pred_tokens else 1.0
+    
+    # Convert token lists to strings for Levenshtein (using separator)
+    gt_str = "\x00".join(gt_tokens)
+    pred_str = "\x00".join(pred_tokens)
+    
+    distance = Levenshtein.distance(gt_str, pred_str)
+    # Approximate token-level distance
+    gt_len = len(gt_tokens)
+    
+    # Count token differences more accurately
+    token_distance = 0
+    alignments = align_tokens_for_confusion(gt_tokens, pred_tokens)
+    for gt_tok, pred_tok in alignments:
+        if gt_tok != pred_tok:
+            token_distance += 1
+    
+    acc = (gt_len - token_distance) / gt_len if gt_len > 0 else 1.0
+    return max(0.0, acc)
+
+
+def align_tokens_for_confusion(gt_tokens: list, pred_tokens: list) -> list:
+    """
+    Align ground truth and predicted token lists.
+    Uses dynamic programming for alignment.
+    Returns list of (gt_token, pred_token) tuples.
     """
     alignments = []
     
-    if not gt_string and not pred_string:
+    if not gt_tokens and not pred_tokens:
         return alignments
     
-    if not gt_string:
-        # All predictions are false positives
-        for p in pred_string:
+    if not gt_tokens:
+        for p in pred_tokens:
             alignments.append(("", p))
         return alignments
     
-    if not pred_string:
-        # All ground truth are missed
-        for g in gt_string:
+    if not pred_tokens:
+        for g in gt_tokens:
             alignments.append((g, ""))
         return alignments
     
-    # Use dynamic programming for alignment
-    m, n = len(gt_string), len(pred_string)
+    m, n = len(gt_tokens), len(pred_tokens)
     dp = [[0] * (n + 1) for _ in range(m + 1)]
     
     for i in range(m + 1):
@@ -111,7 +213,7 @@ def align_strings_for_confusion(gt_string: str, pred_string: str):
     
     for i in range(1, m + 1):
         for j in range(1, n + 1):
-            if gt_string[i-1] == pred_string[j-1]:
+            if gt_tokens[i-1] == pred_tokens[j-1]:
                 dp[i][j] = dp[i-1][j-1]
             else:
                 dp[i][j] = 1 + min(dp[i-1][j], dp[i][j-1], dp[i-1][j-1])
@@ -121,30 +223,30 @@ def align_strings_for_confusion(gt_string: str, pred_string: str):
     aligned_pairs = []
     
     while i > 0 or j > 0:
-        if i > 0 and j > 0 and gt_string[i-1] == pred_string[j-1]:
-            aligned_pairs.append((gt_string[i-1], pred_string[j-1]))
+        if i > 0 and j > 0 and gt_tokens[i-1] == pred_tokens[j-1]:
+            aligned_pairs.append((gt_tokens[i-1], pred_tokens[j-1]))
             i -= 1
             j -= 1
         elif i > 0 and j > 0 and dp[i][j] == dp[i-1][j-1] + 1:
             # Substitution
-            aligned_pairs.append((gt_string[i-1], pred_string[j-1]))
+            aligned_pairs.append((gt_tokens[i-1], pred_tokens[j-1]))
             i -= 1
             j -= 1
         elif j > 0 and dp[i][j] == dp[i][j-1] + 1:
             # Insertion in prediction
-            aligned_pairs.append(("", pred_string[j-1]))
+            aligned_pairs.append(("", pred_tokens[j-1]))
             j -= 1
         elif i > 0 and dp[i][j] == dp[i-1][j] + 1:
             # Deletion (missed in prediction)
-            aligned_pairs.append((gt_string[i-1], ""))
+            aligned_pairs.append((gt_tokens[i-1], ""))
             i -= 1
         else:
             # Fallback
             if j > 0:
-                aligned_pairs.append(("", pred_string[j-1]))
+                aligned_pairs.append(("", pred_tokens[j-1]))
                 j -= 1
             elif i > 0:
-                aligned_pairs.append((gt_string[i-1], ""))
+                aligned_pairs.append((gt_tokens[i-1], ""))
                 i -= 1
     
     aligned_pairs.reverse()
@@ -152,43 +254,56 @@ def align_strings_for_confusion(gt_string: str, pred_string: str):
 
 
 class ConfusionMatrixBuilder:
-    """Build and visualize confusion matrix for OCR characters."""
+    """Build and visualize confusion matrix for OCR tokens (characters/classes)."""
     
     def __init__(self, name: str = "OCR"):
         self.name = name
         self.confusion_counts = defaultdict(lambda: defaultdict(int))
-        self.all_chars = set()
+        self.all_tokens = set()
     
-    def add_prediction(self, gt_string: str, pred_string: str):
-        """Add a prediction pair to the confusion matrix."""
-        gt_normalized = normalize_characters(gt_string) if gt_string else ""
-        pred_normalized = normalize_characters(pred_string) if pred_string else ""
+    def add_prediction(self, gt_tokens: list, pred_tokens: list):
+        """Add a prediction pair to the confusion matrix using token lists."""
+        if gt_tokens is None:
+            gt_tokens = []
+        if pred_tokens is None:
+            pred_tokens = []
         
-        alignments = align_strings_for_confusion(gt_normalized, pred_normalized)
+        alignments = align_tokens_for_confusion(gt_tokens, pred_tokens)
         
-        for gt_char, pred_char in alignments:
-            if gt_char:  # Only count if there's a ground truth character
-                self.confusion_counts[gt_char][pred_char if pred_char else "<MISS>"] += 1
-                self.all_chars.add(gt_char)
-                if pred_char:
-                    self.all_chars.add(pred_char)
+        for gt_token, pred_token in alignments:
+            if gt_token:  # Only count if there's a ground truth token
+                pred_label = pred_token if pred_token else "<MISS>"
+                self.confusion_counts[gt_token][pred_label] += 1
+                self.all_tokens.add(gt_token)
+                if pred_token:
+                    self.all_tokens.add(pred_token)
+    
+    def _sort_tokens(self, tokens):
+        """Sort tokens: digits first (0-9), then single letters (A-Z), then multi-char tokens."""
+        def sort_key(x):
+            if x.isdigit():
+                return (0, int(x))  # Digits first, sorted numerically
+            elif len(x) == 1 and x.isalpha():
+                return (1, x)  # Single letters second
+            else:
+                return (2, x)  # Multi-char tokens last
+        return sorted(tokens, key=sort_key)
     
     def build_matrix(self):
         """Build the confusion matrix as numpy array."""
-        # Sort characters: digits first, then letters
-        chars = sorted(self.all_chars, key=lambda x: (not x.isdigit(), x))
-        chars_with_miss = chars + ["<MISS>"]
+        tokens = self._sort_tokens(self.all_tokens)
+        tokens_with_miss = tokens + ["<MISS>"]
         
-        n_gt = len(chars)
-        n_pred = len(chars_with_miss)
+        n_gt = len(tokens)
+        n_pred = len(tokens_with_miss)
         
         matrix = np.zeros((n_gt, n_pred), dtype=int)
         
-        for i, gt_char in enumerate(chars):
-            for j, pred_char in enumerate(chars_with_miss):
-                matrix[i, j] = self.confusion_counts[gt_char][pred_char]
+        for i, gt_token in enumerate(tokens):
+            for j, pred_token in enumerate(tokens_with_miss):
+                matrix[i, j] = self.confusion_counts[gt_token][pred_token]
         
-        return matrix, chars, chars_with_miss
+        return matrix, tokens, tokens_with_miss
     
     def plot_and_save(self, save_path: str, figsize: tuple = None):
         """Plot confusion matrix and save as image."""
@@ -201,7 +316,7 @@ class ConfusionMatrixBuilder:
         # Determine figure size based on matrix size
         if figsize is None:
             n_labels = max(len(gt_labels), len(pred_labels))
-            figsize = (max(12, n_labels * 0.5), max(10, len(gt_labels) * 0.5))
+            figsize = (max(14, n_labels * 0.6), max(10, len(gt_labels) * 0.5))
         
         fig, ax = plt.subplots(figsize=figsize)
         
@@ -217,13 +332,13 @@ class ConfusionMatrixBuilder:
             cbar_kws={'label': 'Count'}
         )
         
-        ax.set_xlabel('Predicted Character', fontsize=12)
-        ax.set_ylabel('Ground Truth Character', fontsize=12)
+        ax.set_xlabel('Predicted Token', fontsize=12)
+        ax.set_ylabel('Ground Truth Token', fontsize=12)
         ax.set_title(f'Confusion Matrix - {self.name}', fontsize=14)
         
         # Rotate x labels for better readability
-        plt.xticks(rotation=45, ha='right')
-        plt.yticks(rotation=0)
+        plt.xticks(rotation=45, ha='right', fontsize=9)
+        plt.yticks(rotation=0, fontsize=9)
         
         plt.tight_layout()
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
@@ -239,26 +354,24 @@ class ConfusionMatrixBuilder:
             print(f"No data for {self.name}")
             return
         
-        # Calculate per-character accuracy
-        print(f"\n{self.name} - Per-character accuracy:")
-        print("-" * 40)
+        print(f"\n{self.name} - Per-token accuracy:")
+        print("-" * 50)
         
         total_correct = 0
         total_count = 0
         
-        for i, gt_char in enumerate(gt_labels):
+        for i, gt_token in enumerate(gt_labels):
             row_sum = matrix[i, :].sum()
             if row_sum > 0:
-                # Find correct predictions (diagonal)
-                if gt_char in pred_labels:
-                    correct_idx = pred_labels.index(gt_char)
+                if gt_token in pred_labels:
+                    correct_idx = pred_labels.index(gt_token)
                     correct = matrix[i, correct_idx]
                 else:
                     correct = 0
                 accuracy = correct / row_sum * 100
                 total_correct += correct
                 total_count += row_sum
-                print(f"  '{gt_char}': {correct}/{row_sum} ({accuracy:.1f}%)")
+                print(f"  '{gt_token}': {correct}/{row_sum} ({accuracy:.1f}%)")
         
         if total_count > 0:
             overall_acc = total_correct / total_count * 100
@@ -333,7 +446,7 @@ def main():
         model_path=args.sr_model,
         device=args.device,
         debug=False,
-        apply_threshold=False,  # apply SR to all images
+        apply_threshold=False,
         scale_factor=args.scale_factor,
     )
     sr_infer = SuperResolutionInference(sr_config)
@@ -379,8 +492,10 @@ def main():
         xml_filename = img_path.stem + ".xml"
         xml_path = xml_dir / xml_filename
 
-        # --- Ground truth string from XML ---
+        # --- Ground truth string and tokens from XML ---
         gt_string = parse_xml_to_string(xml_path, class_mapping)
+        gt_tokens = parse_xml_to_tokens(xml_path, class_mapping)
+        
         if gt_string is None:
             print(f"Warning: No XML found for {image_filename}, skipping.")
             continue
@@ -389,8 +504,10 @@ def main():
         lr_img = Image.open(img_path).convert("RGB")
         w, h = lr_img.size
 
+        # --- HR image OCR ---
         hr_img = Image.open(hr_path).convert("RGB")
         hr_pred, _ = ocr.recognize(hr_img)
+        hr_pred_tokens = tokenize_plate_string(hr_pred) if hr_pred else []
         hr_acc = calculate_character_accuracy(gt_string, hr_pred)
         hr_accuracies.append(hr_acc)
         if hr_acc > 0.99:
@@ -407,20 +524,22 @@ def main():
 
         # --- OCR on bicubic ---
         bicubic_pred, _ = ocr.recognize(bicubic_img)
+        bicubic_pred_tokens = tokenize_plate_string(bicubic_pred) if bicubic_pred else []
 
         # --- OCR on SR output ---
         sr_pred, _ = ocr.recognize(sr_img)
+        sr_pred_tokens = tokenize_plate_string(sr_pred) if sr_pred else []
 
-        # --- Normalize characters: treat '3' as '2' ---
+        # --- Normalize strings for accuracy calculation ---
         gt_string_normalized = normalize_characters(gt_string)
         hr_pred_normalized = normalize_characters(hr_pred)
         bicubic_pred_normalized = normalize_characters(bicubic_pred)
         sr_pred_normalized = normalize_characters(sr_pred)
 
-        # --- Add to confusion matrices ---
-        cm_hr.add_prediction(gt_string, hr_pred)
-        cm_bicubic.add_prediction(gt_string, bicubic_pred)
-        cm_sr.add_prediction(gt_string, sr_pred)
+        # --- Add to confusion matrices (using tokens) ---
+        cm_hr.add_prediction(gt_tokens, hr_pred_tokens)
+        cm_bicubic.add_prediction(gt_tokens, bicubic_pred_tokens)
+        cm_sr.add_prediction(gt_tokens, sr_pred_tokens)
 
         # --- Calculate accuracies using normalized strings ---
         bicubic_acc = calculate_character_accuracy(gt_string_normalized, bicubic_pred_normalized)
@@ -435,10 +554,10 @@ def main():
 
         print("-" * 40)
         print(f"Image: {image_filename}")
-        print(f"  GT:        {gt_string} -> {gt_string_normalized}")
-        print(f"  HR_Image:   {hr_pred} -> {hr_pred_normalized}  (acc={hr_acc:.2%})")
-        print(f"  Bicubic:   {bicubic_pred} -> {bicubic_pred_normalized}   (acc={bicubic_acc:.2%})")
-        print(f"  SR model:  {sr_pred} -> {sr_pred_normalized}   (acc={sr_acc:.2%})")
+        print(f"  GT:         {gt_string} -> tokens: {gt_tokens}")
+        print(f"  HR_Image:   {hr_pred} -> tokens: {hr_pred_tokens}  (acc={hr_acc:.2%})")
+        print(f"  Bicubic:    {bicubic_pred} -> tokens: {bicubic_pred_tokens}  (acc={bicubic_acc:.2%})")
+        print(f"  SR model:   {sr_pred} -> tokens: {sr_pred_tokens}  (acc={sr_acc:.2%})")
 
     # --- Final summary ---
     if bicubic_accuracies:
@@ -468,7 +587,7 @@ def main():
         cm_bicubic.plot_and_save(str(output_dir / "confusion_matrix_bicubic.png"))
         cm_sr.plot_and_save(str(output_dir / "confusion_matrix_sr.png"))
         
-        # Print per-character summaries
+        # Print per-token summaries
         cm_hr.print_summary()
         cm_bicubic.print_summary()
         cm_sr.print_summary()
@@ -479,7 +598,7 @@ def main():
         print("=" * 40)
         
         # Create a combined figure for display
-        fig, axes = plt.subplots(1, 3, figsize=(24, 8))
+        fig, axes = plt.subplots(1, 3, figsize=(30, 10))
         
         for idx, (cm, ax, title) in enumerate([
             (cm_hr, axes[0], "HR (High Resolution)"),
@@ -498,8 +617,8 @@ def main():
                     ax=ax,
                     cbar_kws={'label': 'Count'}
                 )
-                ax.set_xlabel('Predicted Character', fontsize=10)
-                ax.set_ylabel('Ground Truth Character', fontsize=10)
+                ax.set_xlabel('Predicted Token', fontsize=10)
+                ax.set_ylabel('Ground Truth Token', fontsize=10)
                 ax.set_title(f'Confusion Matrix - {title}', fontsize=12)
                 ax.tick_params(axis='x', rotation=45)
             else:
