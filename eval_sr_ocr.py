@@ -156,110 +156,156 @@ def calculate_character_accuracy(gt_string: str, pred_string: str) -> float:
     return max(0.0, acc)
 
 
-def calculate_token_accuracy(gt_tokens: list, pred_tokens: list) -> float:
+def align_tokens_for_confusion(gt_tokens: list, pred_tokens: list, return_operations: bool = False):
     """
-    Token-level accuracy using Levenshtein distance on token lists.
+    Align ground truth and predicted token lists using Needleman-Wunsch algorithm.
+    This properly handles insertions, deletions, and substitutions.
+    
+    Returns list of (gt_token, pred_token, operation) tuples where operation is:
+    - 'match': tokens are identical
+    - 'substitution': tokens differ
+    - 'deletion': gt token has no corresponding pred token
+    - 'insertion': pred token has no corresponding gt token
     """
-    if not gt_tokens:
-        return 0.0 if pred_tokens else 1.0
-    
-    # Convert token lists to strings for Levenshtein (using separator)
-    gt_str = "\x00".join(gt_tokens)
-    pred_str = "\x00".join(pred_tokens)
-    
-    distance = Levenshtein.distance(gt_str, pred_str)
-    # Approximate token-level distance
-    gt_len = len(gt_tokens)
-    
-    # Count token differences more accurately
-    token_distance = 0
-    alignments = align_tokens_for_confusion(gt_tokens, pred_tokens)
-    for gt_tok, pred_tok in alignments:
-        if gt_tok != pred_tok:
-            token_distance += 1
-    
-    acc = (gt_len - token_distance) / gt_len if gt_len > 0 else 1.0
-    return max(0.0, acc)
-
-
-def align_tokens_for_confusion(gt_tokens: list, pred_tokens: list) -> list:
-    """
-    Align ground truth and predicted token lists.
-    Uses dynamic programming for alignment.
-    Returns list of (gt_token, pred_token) tuples.
-    """
-    alignments = []
-    
     if not gt_tokens and not pred_tokens:
-        return alignments
+        return []
     
     if not gt_tokens:
-        for p in pred_tokens:
-            alignments.append(("", p))
-        return alignments
+        if return_operations:
+            return [("", p, "insertion") for p in pred_tokens]
+        return [("", p) for p in pred_tokens]
     
     if not pred_tokens:
-        for g in gt_tokens:
-            alignments.append((g, ""))
-        return alignments
+        if return_operations:
+            return [(g, "", "deletion") for g in gt_tokens]
+        return [(g, "") for g in gt_tokens]
     
     m, n = len(gt_tokens), len(pred_tokens)
-    dp = [[0] * (n + 1) for _ in range(m + 1)]
     
+    # Gap penalty
+    gap = -1
+    # Match score
+    match_score = 2
+    # Mismatch penalty
+    mismatch = -1
+    
+    # Initialize score matrix
+    score = [[0] * (n + 1) for _ in range(m + 1)]
+    
+    # Initialize traceback matrix
+    # 0: diagonal, 1: up (deletion), 2: left (insertion)
+    traceback = [[0] * (n + 1) for _ in range(m + 1)]
+    
+    # Initialize first row and column
     for i in range(m + 1):
-        dp[i][0] = i
+        score[i][0] = i * gap
+        traceback[i][0] = 1  # up
     for j in range(n + 1):
-        dp[0][j] = j
+        score[0][j] = j * gap
+        traceback[0][j] = 2  # left
     
+    # Fill the matrices
     for i in range(1, m + 1):
         for j in range(1, n + 1):
             if gt_tokens[i-1] == pred_tokens[j-1]:
-                dp[i][j] = dp[i-1][j-1]
+                diag = score[i-1][j-1] + match_score
             else:
-                dp[i][j] = 1 + min(dp[i-1][j], dp[i][j-1], dp[i-1][j-1])
+                diag = score[i-1][j-1] + mismatch
+            
+            up = score[i-1][j] + gap
+            left = score[i][j-1] + gap
+            
+            max_score = max(diag, up, left)
+            score[i][j] = max_score
+            
+            if max_score == diag:
+                traceback[i][j] = 0
+            elif max_score == up:
+                traceback[i][j] = 1
+            else:
+                traceback[i][j] = 2
     
-    # Backtrack to find alignment
-    i, j = m, n
+    # Traceback to find alignment
     aligned_pairs = []
+    i, j = m, n
     
     while i > 0 or j > 0:
-        if i > 0 and j > 0 and gt_tokens[i-1] == pred_tokens[j-1]:
-            aligned_pairs.append((gt_tokens[i-1], pred_tokens[j-1]))
+        if i > 0 and j > 0 and traceback[i][j] == 0:
+            # Diagonal: match or substitution
+            gt_tok = gt_tokens[i-1]
+            pred_tok = pred_tokens[j-1]
+            if gt_tok == pred_tok:
+                op = "match"
+            else:
+                op = "substitution"
+            if return_operations:
+                aligned_pairs.append((gt_tok, pred_tok, op))
+            else:
+                aligned_pairs.append((gt_tok, pred_tok))
             i -= 1
             j -= 1
-        elif i > 0 and j > 0 and dp[i][j] == dp[i-1][j-1] + 1:
-            # Substitution
-            aligned_pairs.append((gt_tokens[i-1], pred_tokens[j-1]))
-            i -= 1
-            j -= 1
-        elif j > 0 and dp[i][j] == dp[i][j-1] + 1:
-            # Insertion in prediction
-            aligned_pairs.append(("", pred_tokens[j-1]))
-            j -= 1
-        elif i > 0 and dp[i][j] == dp[i-1][j] + 1:
-            # Deletion (missed in prediction)
-            aligned_pairs.append((gt_tokens[i-1], ""))
+        elif i > 0 and (j == 0 or traceback[i][j] == 1):
+            # Up: deletion (GT token not in prediction)
+            if return_operations:
+                aligned_pairs.append((gt_tokens[i-1], "", "deletion"))
+            else:
+                aligned_pairs.append((gt_tokens[i-1], ""))
             i -= 1
         else:
-            # Fallback
-            if j > 0:
+            # Left: insertion (extra token in prediction)
+            if return_operations:
+                aligned_pairs.append(("", pred_tokens[j-1], "insertion"))
+            else:
                 aligned_pairs.append(("", pred_tokens[j-1]))
-                j -= 1
-            elif i > 0:
-                aligned_pairs.append((gt_tokens[i-1], ""))
-                i -= 1
+            j -= 1
     
     aligned_pairs.reverse()
     return aligned_pairs
 
 
+def print_alignment_details(gt_tokens: list, pred_tokens: list, label: str = ""):
+    """
+    Print detailed alignment information for debugging.
+    """
+    alignments = align_tokens_for_confusion(gt_tokens, pred_tokens, return_operations=True)
+    
+    print(f"\n  Alignment details for {label}:")
+    print(f"  {'GT Token':<12} {'Pred Token':<12} {'Operation':<15}")
+    print(f"  {'-'*12} {'-'*12} {'-'*15}")
+    
+    for item in alignments:
+        gt_tok, pred_tok, op = item
+        gt_display = gt_tok if gt_tok else "(none)"
+        pred_display = pred_tok if pred_tok else "(none)"
+        
+        # Add symbol for clarity
+        if op == "match":
+            symbol = "✓"
+        elif op == "substitution":
+            symbol = "✗ (sub)"
+        elif op == "deletion":
+            symbol = "✗ (del)"
+        else:  # insertion
+            symbol = "✗ (ins)"
+        
+        print(f"  {gt_display:<12} {pred_display:<12} {symbol}")
+    
+    return alignments
+
+
 class ConfusionMatrixBuilder:
     """Build and visualize confusion matrix for OCR tokens (characters/classes)."""
     
-    def __init__(self, name: str = "OCR"):
+    def __init__(self, name: str = "OCR", track_insertions: bool = True):
         self.name = name
+        self.track_insertions = track_insertions
         self.confusion_counts = defaultdict(lambda: defaultdict(int))
-        self.all_tokens = set()
+        self.all_gt_tokens = set()
+        self.all_pred_tokens = set()
+        self.insertion_counts = defaultdict(int)  # Track false positive insertions
+        self.deletion_counts = defaultdict(int)   # Track missed detections
+        self.total_insertions = 0
+        self.total_deletions = 0
     
     def add_prediction(self, gt_tokens: list, pred_tokens: list):
         """Add a prediction pair to the confusion matrix using token lists."""
@@ -268,42 +314,68 @@ class ConfusionMatrixBuilder:
         if pred_tokens is None:
             pred_tokens = []
         
-        alignments = align_tokens_for_confusion(gt_tokens, pred_tokens)
+        alignments = align_tokens_for_confusion(gt_tokens, pred_tokens, return_operations=True)
         
-        for gt_token, pred_token in alignments:
-            if gt_token:  # Only count if there's a ground truth token
-                pred_label = pred_token if pred_token else "<MISS>"
-                self.confusion_counts[gt_token][pred_label] += 1
-                self.all_tokens.add(gt_token)
-                if pred_token:
-                    self.all_tokens.add(pred_token)
+        for item in alignments:
+            gt_token, pred_token, operation = item
+            
+            if operation == "match":
+                # Correct prediction
+                self.confusion_counts[gt_token][gt_token] += 1
+                self.all_gt_tokens.add(gt_token)
+                self.all_pred_tokens.add(gt_token)
+                
+            elif operation == "substitution":
+                # Wrong prediction
+                self.confusion_counts[gt_token][pred_token] += 1
+                self.all_gt_tokens.add(gt_token)
+                self.all_pred_tokens.add(pred_token)
+                
+            elif operation == "deletion":
+                # GT token was missed (not predicted)
+                self.confusion_counts[gt_token]["<MISS>"] += 1
+                self.all_gt_tokens.add(gt_token)
+                self.deletion_counts[gt_token] += 1
+                self.total_deletions += 1
+                
+            elif operation == "insertion":
+                # Extra prediction (false positive)
+                if self.track_insertions:
+                    self.insertion_counts[pred_token] += 1
+                    self.all_pred_tokens.add(pred_token)
+                    self.total_insertions += 1
     
     def _sort_tokens(self, tokens):
         """Sort tokens: digits first (0-9), then single letters (A-Z), then multi-char tokens."""
         def sort_key(x):
-            if x.isdigit():
+            if x == "<MISS>":
+                return (3, x)  # <MISS> at the end
+            elif x == "<INS>":
+                return (4, x)  # <INS> at the very end
+            elif x.isdigit():
                 return (0, int(x))  # Digits first, sorted numerically
             elif len(x) == 1 and x.isalpha():
                 return (1, x)  # Single letters second
             else:
-                return (2, x)  # Multi-char tokens last
+                return (2, x)  # Multi-char tokens third
         return sorted(tokens, key=sort_key)
     
     def build_matrix(self):
         """Build the confusion matrix as numpy array."""
-        tokens = self._sort_tokens(self.all_tokens)
-        tokens_with_miss = tokens + ["<MISS>"]
+        gt_tokens = self._sort_tokens(self.all_gt_tokens)
+        pred_tokens = self._sort_tokens(self.all_pred_tokens - {"<MISS>"})
+        pred_tokens_with_miss = pred_tokens + ["<MISS>"]
         
-        n_gt = len(tokens)
-        n_pred = len(tokens_with_miss)
+        n_gt = len(gt_tokens)
+        n_pred = len(pred_tokens_with_miss)
         
         matrix = np.zeros((n_gt, n_pred), dtype=int)
         
-        for i, gt_token in enumerate(tokens):
-            for j, pred_token in enumerate(tokens_with_miss):
+        for i, gt_token in enumerate(gt_tokens):
+            for j, pred_token in enumerate(pred_tokens_with_miss):
                 matrix[i, j] = self.confusion_counts[gt_token][pred_token]
         
-        return matrix, tokens, tokens_with_miss
+        return matrix, gt_tokens, pred_tokens_with_miss
     
     def plot_and_save(self, save_path: str, figsize: tuple = None):
         """Plot confusion matrix and save as image."""
@@ -354,8 +426,9 @@ class ConfusionMatrixBuilder:
             print(f"No data for {self.name}")
             return
         
-        print(f"\n{self.name} - Per-token accuracy:")
-        print("-" * 50)
+        print(f"\n{'='*50}")
+        print(f"{self.name} - Per-token accuracy:")
+        print(f"{'='*50}")
         
         total_correct = 0
         total_count = 0
@@ -371,11 +444,30 @@ class ConfusionMatrixBuilder:
                 accuracy = correct / row_sum * 100
                 total_correct += correct
                 total_count += row_sum
-                print(f"  '{gt_token}': {correct}/{row_sum} ({accuracy:.1f}%)")
+                
+                # Show common confusions
+                confusions = []
+                for j, pred_token in enumerate(pred_labels):
+                    if pred_token != gt_token and matrix[i, j] > 0:
+                        confusions.append(f"{pred_token}:{matrix[i, j]}")
+                
+                conf_str = f" | Confused with: {', '.join(confusions)}" if confusions else ""
+                print(f"  '{gt_token}': {correct}/{row_sum} ({accuracy:.1f}%){conf_str}")
         
         if total_count > 0:
             overall_acc = total_correct / total_count * 100
             print(f"\n  Overall: {total_correct}/{total_count} ({overall_acc:.1f}%)")
+        
+        # Print insertion/deletion stats
+        if self.total_insertions > 0:
+            print(f"\n  False Positives (insertions): {self.total_insertions}")
+            for token, count in sorted(self.insertion_counts.items(), key=lambda x: -x[1])[:5]:
+                print(f"    '{token}': {count}")
+        
+        if self.total_deletions > 0:
+            print(f"\n  Missed Detections (deletions): {self.total_deletions}")
+            for token, count in sorted(self.deletion_counts.items(), key=lambda x: -x[1])[:5]:
+                print(f"    '{token}': {count}")
 
 
 def main():
@@ -432,6 +524,11 @@ def main():
         type=str,
         default="eval_results",
         help="Directory to save confusion matrix images (default: eval_results)",
+    )
+    parser.add_argument(
+        "--show-alignment",
+        action="store_true",
+        help="Show detailed alignment for each image (verbose output)",
     )
     args = parser.parse_args()
 
@@ -552,12 +649,16 @@ def main():
         if sr_acc > 0.99:
             sr_perfect += 1
 
-        print("-" * 40)
+        print("-" * 60)
         print(f"Image: {image_filename}")
         print(f"  GT:         {gt_string} -> tokens: {gt_tokens}")
         print(f"  HR_Image:   {hr_pred} -> tokens: {hr_pred_tokens}  (acc={hr_acc:.2%})")
         print(f"  Bicubic:    {bicubic_pred} -> tokens: {bicubic_pred_tokens}  (acc={bicubic_acc:.2%})")
         print(f"  SR model:   {sr_pred} -> tokens: {sr_pred_tokens}  (acc={sr_acc:.2%})")
+        
+        # Show detailed alignment if requested or if there are errors
+        if args.show_alignment or (sr_acc < 0.99 and sr_acc > 0):
+            print_alignment_details(gt_tokens, sr_pred_tokens, "SR model")
 
     # --- Final summary ---
     if bicubic_accuracies:
@@ -565,8 +666,9 @@ def main():
         avg_bicubic = sum(bicubic_accuracies) / len(bicubic_accuracies)
         avg_sr = sum(sr_accuracies) / len(sr_accuracies)
 
-        print("\n" + "=" * 40)
+        print("\n" + "=" * 60)
         print("EVALUATION COMPLETE")
+        print("=" * 60)
         print("Note: Characters '3' treated as '2' for accuracy calculation")
         print(f"Images evaluated: {len(bicubic_accuracies)}")
         print(f"Average char accuracy (HR): {avg_hr:.2%}")
@@ -575,12 +677,12 @@ def main():
         print(f"Perfect plates (acc>0.99) HR: {hr_perfect}")
         print(f"Perfect plates (acc>0.99) Bicubic: {bicubic_perfect}")
         print(f"Perfect plates (acc>0.99) SR:      {sr_perfect}")
-        print("=" * 40)
+        print("=" * 60)
         
         # --- Generate and save confusion matrices ---
-        print("\n" + "=" * 40)
+        print("\n" + "=" * 60)
         print("GENERATING CONFUSION MATRICES")
-        print("=" * 40)
+        print("=" * 60)
         
         # Save confusion matrix images
         cm_hr.plot_and_save(str(output_dir / "confusion_matrix_hr.png"))
@@ -593,9 +695,9 @@ def main():
         cm_sr.print_summary()
         
         # Display confusion matrices
-        print("\n" + "=" * 40)
+        print("\n" + "=" * 60)
         print("DISPLAYING CONFUSION MATRICES")
-        print("=" * 40)
+        print("=" * 60)
         
         # Create a combined figure for display
         fig, axes = plt.subplots(1, 3, figsize=(30, 10))

@@ -271,7 +271,7 @@ if __name__ == "__main__":
     trainer = Trainer(sr_config)
 
     # resume
-    if args.resume_from is not None:
-        trainer.load_checkpoint(args.resume_from)
+    if args.resume_dir is not None:
+        trainer.load_checkpoint(args.resume_dir)
 
     trainer.train(train_loader, val_loader, num_epochs=args.epochs)
