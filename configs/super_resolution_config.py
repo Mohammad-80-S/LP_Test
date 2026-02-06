@@ -26,12 +26,12 @@ class SuperResolutionConfig(BaseConfig):
     # Preprocessing
     resize_to_training_size: bool = True  # Resize input to training dimensions before SR
     
-    # Inference settings
-    patch_size: int = 8
-    stride_roi: int = 4
-    stride_bg: int = 8
-    roi_margin: int = 2
-    detect_scale: int = 4
+    # # Inference settings
+    # patch_size: int = 8
+    # stride_roi: int = 4
+    # stride_bg: int = 8
+    # roi_margin: int = 2
+    # detect_scale: int = 4
     
     # Training settings
     batch_size: int = 128
