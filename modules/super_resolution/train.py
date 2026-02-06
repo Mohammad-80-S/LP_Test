@@ -131,7 +131,7 @@ class Trainer:
                 f"Epoch [{epoch+1}/{num_epochs}] "
                 f"Train: {epoch_train_loss:.6f} Val: {epoch_val_loss:.6f}"
             )
-    
+
     def plot_losses(self, save_path: str = None):
         """Plot training and validation loss history."""
         plt.figure(figsize=(10, 5))
@@ -275,3 +275,4 @@ if __name__ == "__main__":
         trainer.load_checkpoint(args.resume_dir)
 
     trainer.train(train_loader, val_loader, num_epochs=args.epochs)
+    trainer.plot_losses(Path(args.checkpoint_dir) / f'lost_model.png')
