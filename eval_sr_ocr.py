@@ -19,6 +19,7 @@ import Levenshtein
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
+from matplotlib.colors import LinearSegmentedColormap
 
 from configs import SuperResolutionConfig, OCRConfig
 from modules.super_resolution import SuperResolutionInference
@@ -27,6 +28,9 @@ from modules.ocr import OCRRecognizer
 
 # Define multi-character tokens that should be treated as single units
 MULTI_CHAR_TOKENS = ["Ein", "Gh", "Sad", "Sin", "Ta", "Zh"]
+
+# Background token for confusion matrix
+BG_TOKEN = "<BG>"
 
 
 def tokenize_plate_string(text: str) -> list:
@@ -164,21 +168,21 @@ def align_tokens_for_confusion(gt_tokens: list, pred_tokens: list, return_operat
     Returns list of (gt_token, pred_token, operation) tuples where operation is:
     - 'match': tokens are identical
     - 'substitution': tokens differ
-    - 'deletion': gt token has no corresponding pred token
-    - 'insertion': pred token has no corresponding gt token
+    - 'deletion': gt token has no corresponding pred token (gt=char, pred=background)
+    - 'insertion': pred token has no corresponding gt token (gt=background, pred=char)
     """
     if not gt_tokens and not pred_tokens:
         return []
     
     if not gt_tokens:
         if return_operations:
-            return [("", p, "insertion") for p in pred_tokens]
-        return [("", p) for p in pred_tokens]
+            return [(BG_TOKEN, p, "insertion") for p in pred_tokens]
+        return [(BG_TOKEN, p) for p in pred_tokens]
     
     if not pred_tokens:
         if return_operations:
-            return [(g, "", "deletion") for g in gt_tokens]
-        return [(g, "") for g in gt_tokens]
+            return [(g, BG_TOKEN, "deletion") for g in gt_tokens]
+        return [(g, BG_TOKEN) for g in gt_tokens]
     
     m, n = len(gt_tokens), len(pred_tokens)
     
@@ -245,18 +249,18 @@ def align_tokens_for_confusion(gt_tokens: list, pred_tokens: list, return_operat
             i -= 1
             j -= 1
         elif i > 0 and (j == 0 or traceback[i][j] == 1):
-            # Up: deletion (GT token not in prediction)
+            # Up: deletion (GT token not in prediction -> predicted as background)
             if return_operations:
-                aligned_pairs.append((gt_tokens[i-1], "", "deletion"))
+                aligned_pairs.append((gt_tokens[i-1], BG_TOKEN, "deletion"))
             else:
-                aligned_pairs.append((gt_tokens[i-1], ""))
+                aligned_pairs.append((gt_tokens[i-1], BG_TOKEN))
             i -= 1
         else:
-            # Left: insertion (extra token in prediction)
+            # Left: insertion (extra token in prediction -> background recognized as char)
             if return_operations:
-                aligned_pairs.append(("", pred_tokens[j-1], "insertion"))
+                aligned_pairs.append((BG_TOKEN, pred_tokens[j-1], "insertion"))
             else:
-                aligned_pairs.append(("", pred_tokens[j-1]))
+                aligned_pairs.append((BG_TOKEN, pred_tokens[j-1]))
             j -= 1
     
     aligned_pairs.reverse()
@@ -275,8 +279,8 @@ def print_alignment_details(gt_tokens: list, pred_tokens: list, label: str = "")
     
     for item in alignments:
         gt_tok, pred_tok, op = item
-        gt_display = gt_tok if gt_tok else "(none)"
-        pred_display = pred_tok if pred_tok else "(none)"
+        gt_display = gt_tok if gt_tok != BG_TOKEN else "(background)"
+        pred_display = pred_tok if pred_tok != BG_TOKEN else "(background)"
         
         # Add symbol for clarity
         if op == "match":
@@ -284,26 +288,30 @@ def print_alignment_details(gt_tokens: list, pred_tokens: list, label: str = "")
         elif op == "substitution":
             symbol = "✗ (sub)"
         elif op == "deletion":
-            symbol = "✗ (del)"
+            symbol = "✗ (del) - missed character"
         else:  # insertion
-            symbol = "✗ (ins)"
+            symbol = "✗ (ins) - false positive"
         
         print(f"  {gt_display:<12} {pred_display:<12} {symbol}")
     
     return alignments
 
 
+def create_white_green_cmap():
+    """Create a custom colormap from white to green."""
+    colors = ['#FFFFFF', '#E8F5E9', '#C8E6C9', '#A5D6A7', '#81C784', 
+              '#66BB6A', '#4CAF50', '#43A047', '#388E3C', '#2E7D32', '#1B5E20']
+    return LinearSegmentedColormap.from_list('WhiteGreen', colors, N=256)
+
+
 class ConfusionMatrixBuilder:
     """Build and visualize confusion matrix for OCR tokens (characters/classes)."""
     
-    def __init__(self, name: str = "OCR", track_insertions: bool = True):
+    def __init__(self, name: str = "OCR"):
         self.name = name
-        self.track_insertions = track_insertions
         self.confusion_counts = defaultdict(lambda: defaultdict(int))
         self.all_gt_tokens = set()
         self.all_pred_tokens = set()
-        self.insertion_counts = defaultdict(int)  # Track false positive insertions
-        self.deletion_counts = defaultdict(int)   # Track missed detections
         self.total_insertions = 0
         self.total_deletions = 0
     
@@ -326,32 +334,32 @@ class ConfusionMatrixBuilder:
                 self.all_pred_tokens.add(gt_token)
                 
             elif operation == "substitution":
-                # Wrong prediction
+                # Wrong prediction (one char confused with another)
                 self.confusion_counts[gt_token][pred_token] += 1
                 self.all_gt_tokens.add(gt_token)
                 self.all_pred_tokens.add(pred_token)
                 
             elif operation == "deletion":
-                # GT token was missed (not predicted)
-                self.confusion_counts[gt_token]["<MISS>"] += 1
+                # GT token was missed -> predicted as background
+                # Row: actual character, Column: <BG>
+                self.confusion_counts[gt_token][BG_TOKEN] += 1
                 self.all_gt_tokens.add(gt_token)
-                self.deletion_counts[gt_token] += 1
+                self.all_pred_tokens.add(BG_TOKEN)
                 self.total_deletions += 1
                 
             elif operation == "insertion":
-                # Extra prediction (false positive)
-                if self.track_insertions:
-                    self.insertion_counts[pred_token] += 1
-                    self.all_pred_tokens.add(pred_token)
-                    self.total_insertions += 1
+                # Background was predicted as a character (false positive)
+                # Row: <BG>, Column: predicted character
+                self.confusion_counts[BG_TOKEN][pred_token] += 1
+                self.all_gt_tokens.add(BG_TOKEN)
+                self.all_pred_tokens.add(pred_token)
+                self.total_insertions += 1
     
     def _sort_tokens(self, tokens):
-        """Sort tokens: digits first (0-9), then single letters (A-Z), then multi-char tokens."""
+        """Sort tokens: digits first (0-9), then single letters (A-Z), then multi-char tokens, then <BG>."""
         def sort_key(x):
-            if x == "<MISS>":
-                return (3, x)  # <MISS> at the end
-            elif x == "<INS>":
-                return (4, x)  # <INS> at the very end
+            if x == BG_TOKEN:
+                return (4, x)  # <BG> at the end
             elif x.isdigit():
                 return (0, int(x))  # Digits first, sorted numerically
             elif len(x) == 1 and x.isalpha():
@@ -362,24 +370,45 @@ class ConfusionMatrixBuilder:
     
     def build_matrix(self):
         """Build the confusion matrix as numpy array."""
-        gt_tokens = self._sort_tokens(self.all_gt_tokens)
-        pred_tokens = self._sort_tokens(self.all_pred_tokens - {"<MISS>"})
-        pred_tokens_with_miss = pred_tokens + ["<MISS>"]
+        # Get all unique tokens and sort them
+        all_tokens = self.all_gt_tokens | self.all_pred_tokens
+        sorted_tokens = self._sort_tokens(all_tokens)
         
-        n_gt = len(gt_tokens)
-        n_pred = len(pred_tokens_with_miss)
+        n = len(sorted_tokens)
+        matrix = np.zeros((n, n), dtype=int)
         
-        matrix = np.zeros((n_gt, n_pred), dtype=int)
-        
-        for i, gt_token in enumerate(gt_tokens):
-            for j, pred_token in enumerate(pred_tokens_with_miss):
+        for i, gt_token in enumerate(sorted_tokens):
+            for j, pred_token in enumerate(sorted_tokens):
                 matrix[i, j] = self.confusion_counts[gt_token][pred_token]
         
-        return matrix, gt_tokens, pred_tokens_with_miss
+        return matrix, sorted_tokens, sorted_tokens
     
-    def plot_and_save(self, save_path: str, figsize: tuple = None):
+    def build_normalized_matrix(self):
+        """Build the normalized confusion matrix (row-wise normalization)."""
+        matrix, gt_tokens, pred_tokens = self.build_matrix()
+        
+        # Normalize each row (each ground truth class)
+        row_sums = matrix.sum(axis=1, keepdims=True)
+        # Avoid division by zero
+        row_sums = np.where(row_sums == 0, 1, row_sums)
+        normalized_matrix = matrix.astype(float) / row_sums
+        
+        return normalized_matrix, gt_tokens, pred_tokens
+    
+    def plot_and_save(self, save_path: str, figsize: tuple = None, normalized: bool = False):
         """Plot confusion matrix and save as image."""
-        matrix, gt_labels, pred_labels = self.build_matrix()
+        if normalized:
+            matrix, gt_labels, pred_labels = self.build_normalized_matrix()
+            fmt = '.2f'
+            title_suffix = "(Normalized)"
+            cbar_label = 'Proportion'
+            vmin, vmax = 0, 1
+        else:
+            matrix, gt_labels, pred_labels = self.build_matrix()
+            fmt = 'd'
+            title_suffix = "(Count)"
+            cbar_label = 'Count'
+            vmin, vmax = None, None
         
         if len(gt_labels) == 0:
             print(f"Warning: No data to plot for {self.name} confusion matrix")
@@ -387,30 +416,46 @@ class ConfusionMatrixBuilder:
         
         # Determine figure size based on matrix size
         if figsize is None:
-            n_labels = max(len(gt_labels), len(pred_labels))
-            figsize = (max(14, n_labels * 0.6), max(10, len(gt_labels) * 0.5))
+            n_labels = len(gt_labels)
+            figsize = (max(14, n_labels * 0.6), max(10, n_labels * 0.5))
         
         fig, ax = plt.subplots(figsize=figsize)
+        
+        # Use custom white-green colormap
+        cmap = create_white_green_cmap()
         
         # Create heatmap
         sns.heatmap(
             matrix,
             annot=True,
-            fmt='d',
-            cmap='Blues',
+            fmt=fmt,
+            cmap=cmap,
             xticklabels=pred_labels,
             yticklabels=gt_labels,
             ax=ax,
-            cbar_kws={'label': 'Count'}
+            cbar_kws={'label': cbar_label},
+            vmin=vmin,
+            vmax=vmax,
+            linewidths=0.5,
+            linecolor='lightgray'
         )
         
         ax.set_xlabel('Predicted Token', fontsize=12)
         ax.set_ylabel('Ground Truth Token', fontsize=12)
-        ax.set_title(f'Confusion Matrix - {self.name}', fontsize=14)
+        ax.set_title(f'Confusion Matrix - {self.name} {title_suffix}', fontsize=14)
         
         # Rotate x labels for better readability
         plt.xticks(rotation=45, ha='right', fontsize=9)
         plt.yticks(rotation=0, fontsize=9)
+        
+        # Highlight <BG> row and column with different background
+        if BG_TOKEN in gt_labels:
+            bg_idx = gt_labels.index(BG_TOKEN)
+            # Add a subtle highlight to the BG row and column
+            ax.axhline(y=bg_idx, color='orange', linewidth=2)
+            ax.axhline(y=bg_idx + 1, color='orange', linewidth=2)
+            ax.axvline(x=bg_idx, color='orange', linewidth=2)
+            ax.axvline(x=bg_idx + 1, color='orange', linewidth=2)
         
         plt.tight_layout()
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
@@ -420,54 +465,135 @@ class ConfusionMatrixBuilder:
     
     def print_summary(self):
         """Print summary statistics from confusion matrix."""
-        matrix, gt_labels, pred_labels = self.build_matrix()
+        matrix, labels, _ = self.build_matrix()
         
-        if len(gt_labels) == 0:
+        if len(labels) == 0:
             print(f"No data for {self.name}")
             return
         
-        print(f"\n{'='*50}")
+        print(f"\n{'='*60}")
         print(f"{self.name} - Per-token accuracy:")
-        print(f"{'='*50}")
+        print(f"{'='*60}")
         
         total_correct = 0
         total_count = 0
         
-        for i, gt_token in enumerate(gt_labels):
+        for i, gt_token in enumerate(labels):
             row_sum = matrix[i, :].sum()
             if row_sum > 0:
-                if gt_token in pred_labels:
-                    correct_idx = pred_labels.index(gt_token)
-                    correct = matrix[i, correct_idx]
-                else:
-                    correct = 0
+                # Correct predictions are on the diagonal
+                correct = matrix[i, i]
                 accuracy = correct / row_sum * 100
-                total_correct += correct
-                total_count += row_sum
+                
+                if gt_token != BG_TOKEN:
+                    total_correct += correct
+                    total_count += row_sum
                 
                 # Show common confusions
                 confusions = []
-                for j, pred_token in enumerate(pred_labels):
-                    if pred_token != gt_token and matrix[i, j] > 0:
+                for j, pred_token in enumerate(labels):
+                    if i != j and matrix[i, j] > 0:
                         confusions.append(f"{pred_token}:{matrix[i, j]}")
                 
                 conf_str = f" | Confused with: {', '.join(confusions)}" if confusions else ""
-                print(f"  '{gt_token}': {correct}/{row_sum} ({accuracy:.1f}%){conf_str}")
+                
+                if gt_token == BG_TOKEN:
+                    print(f"  '{gt_token}' (Background -> False Positives): {row_sum} total{conf_str}")
+                else:
+                    print(f"  '{gt_token}': {correct}/{row_sum} ({accuracy:.1f}%){conf_str}")
         
         if total_count > 0:
             overall_acc = total_correct / total_count * 100
-            print(f"\n  Overall: {total_correct}/{total_count} ({overall_acc:.1f}%)")
+            print(f"\n  Overall (excluding background): {total_correct}/{total_count} ({overall_acc:.1f}%)")
         
-        # Print insertion/deletion stats
-        if self.total_insertions > 0:
-            print(f"\n  False Positives (insertions): {self.total_insertions}")
-            for token, count in sorted(self.insertion_counts.items(), key=lambda x: -x[1])[:5]:
-                print(f"    '{token}': {count}")
+        # Print insertion/deletion summary
+        if BG_TOKEN in labels:
+            bg_idx = labels.index(BG_TOKEN)
+            
+            # Deletions: characters predicted as background (column <BG>, excluding row <BG>)
+            deletions = sum(matrix[i, bg_idx] for i in range(len(labels)) if i != bg_idx)
+            
+            # Insertions: background predicted as characters (row <BG>, excluding column <BG>)
+            insertions = sum(matrix[bg_idx, j] for j in range(len(labels)) if j != bg_idx)
+            
+            print(f"\n  Background Statistics:")
+            print(f"    Deletions (char -> background): {deletions}")
+            print(f"    Insertions (background -> char): {insertions}")
+
+
+def plot_combined_matrices(cms: list, output_dir: Path, normalized: bool = False):
+    """
+    Plot combined confusion matrices for all methods in a single figure.
+    
+    Args:
+        cms: List of tuples (ConfusionMatrixBuilder, title)
+        output_dir: Directory to save the output
+        normalized: If True, plot normalized matrices
+    """
+    n_matrices = len(cms)
+    fig, axes = plt.subplots(1, n_matrices, figsize=(10 * n_matrices, 10))
+    
+    if n_matrices == 1:
+        axes = [axes]
+    
+    # Use custom white-green colormap
+    cmap = create_white_green_cmap()
+    
+    for idx, (cm, title) in enumerate(cms):
+        ax = axes[idx]
         
-        if self.total_deletions > 0:
-            print(f"\n  Missed Detections (deletions): {self.total_deletions}")
-            for token, count in sorted(self.deletion_counts.items(), key=lambda x: -x[1])[:5]:
-                print(f"    '{token}': {count}")
+        if normalized:
+            matrix, gt_labels, pred_labels = cm.build_normalized_matrix()
+            fmt = '.2f'
+            title_suffix = "(Normalized)"
+            cbar_label = 'Proportion'
+            vmin, vmax = 0, 1
+        else:
+            matrix, gt_labels, pred_labels = cm.build_matrix()
+            fmt = 'd'
+            title_suffix = "(Count)"
+            cbar_label = 'Count'
+            vmin, vmax = None, None
+        
+        if len(gt_labels) > 0:
+            sns.heatmap(
+                matrix,
+                annot=True,
+                fmt=fmt,
+                cmap=cmap,
+                xticklabels=pred_labels,
+                yticklabels=gt_labels,
+                ax=ax,
+                cbar_kws={'label': cbar_label},
+                vmin=vmin,
+                vmax=vmax,
+                linewidths=0.5,
+                linecolor='lightgray'
+            )
+            ax.set_xlabel('Predicted Token', fontsize=10)
+            ax.set_ylabel('Ground Truth Token', fontsize=10)
+            ax.set_title(f'{title}\n{title_suffix}', fontsize=12)
+            ax.tick_params(axis='x', rotation=45)
+            
+            # Highlight <BG> row and column
+            if BG_TOKEN in gt_labels:
+                bg_idx = gt_labels.index(BG_TOKEN)
+                ax.axhline(y=bg_idx, color='orange', linewidth=2)
+                ax.axhline(y=bg_idx + 1, color='orange', linewidth=2)
+                ax.axvline(x=bg_idx, color='orange', linewidth=2)
+                ax.axvline(x=bg_idx + 1, color='orange', linewidth=2)
+        else:
+            ax.text(0.5, 0.5, 'No Data', ha='center', va='center', fontsize=14)
+            ax.set_title(f'{title}\n{title_suffix}', fontsize=12)
+    
+    plt.tight_layout()
+    
+    suffix = "normalized" if normalized else "count"
+    save_path = output_dir / f"confusion_matrix_combined_{suffix}.png"
+    plt.savefig(str(save_path), dpi=150, bbox_inches='tight')
+    print(f"Combined confusion matrix ({suffix}) saved: {save_path}")
+    
+    return fig
 
 
 def main():
@@ -684,55 +810,64 @@ def main():
         print("GENERATING CONFUSION MATRICES")
         print("=" * 60)
         
-        # Save confusion matrix images
-        cm_hr.plot_and_save(str(output_dir / "confusion_matrix_hr.png"))
-        cm_bicubic.plot_and_save(str(output_dir / "confusion_matrix_bicubic.png"))
-        cm_sr.plot_and_save(str(output_dir / "confusion_matrix_sr.png"))
+        # Save individual confusion matrix images (both count and normalized)
+        # HR matrices
+        cm_hr.plot_and_save(
+            str(output_dir / "confusion_matrix_hr_count.png"), 
+            normalized=False
+        )
+        cm_hr.plot_and_save(
+            str(output_dir / "confusion_matrix_hr_normalized.png"), 
+            normalized=True
+        )
+        
+        # Bicubic matrices
+        cm_bicubic.plot_and_save(
+            str(output_dir / "confusion_matrix_bicubic_count.png"), 
+            normalized=False
+        )
+        cm_bicubic.plot_and_save(
+            str(output_dir / "confusion_matrix_bicubic_normalized.png"), 
+            normalized=True
+        )
+        
+        # SR matrices
+        cm_sr.plot_and_save(
+            str(output_dir / "confusion_matrix_sr_count.png"), 
+            normalized=False
+        )
+        cm_sr.plot_and_save(
+            str(output_dir / "confusion_matrix_sr_normalized.png"), 
+            normalized=True
+        )
         
         # Print per-token summaries
         cm_hr.print_summary()
         cm_bicubic.print_summary()
         cm_sr.print_summary()
         
-        # Display confusion matrices
+        # --- Create combined figures ---
+        print("\n" + "=" * 60)
+        print("GENERATING COMBINED CONFUSION MATRICES")
+        print("=" * 60)
+        
+        cms_list = [
+            (cm_hr, "HR (High Resolution)"),
+            (cm_bicubic, "Bicubic Upsampling"),
+            (cm_sr, "Super Resolution")
+        ]
+        
+        # Combined count matrix
+        fig_count = plot_combined_matrices(cms_list, output_dir, normalized=False)
+        
+        # Combined normalized matrix
+        fig_normalized = plot_combined_matrices(cms_list, output_dir, normalized=True)
+        
+        # Display the plots
         print("\n" + "=" * 60)
         print("DISPLAYING CONFUSION MATRICES")
         print("=" * 60)
         
-        # Create a combined figure for display
-        fig, axes = plt.subplots(1, 3, figsize=(30, 10))
-        
-        for idx, (cm, ax, title) in enumerate([
-            (cm_hr, axes[0], "HR (High Resolution)"),
-            (cm_bicubic, axes[1], "Bicubic Upsampling"),
-            (cm_sr, axes[2], "Super Resolution")
-        ]):
-            matrix, gt_labels, pred_labels = cm.build_matrix()
-            if len(gt_labels) > 0:
-                sns.heatmap(
-                    matrix,
-                    annot=True,
-                    fmt='d',
-                    cmap='Blues',
-                    xticklabels=pred_labels,
-                    yticklabels=gt_labels,
-                    ax=ax,
-                    cbar_kws={'label': 'Count'}
-                )
-                ax.set_xlabel('Predicted Token', fontsize=10)
-                ax.set_ylabel('Ground Truth Token', fontsize=10)
-                ax.set_title(f'Confusion Matrix - {title}', fontsize=12)
-                ax.tick_params(axis='x', rotation=45)
-            else:
-                ax.text(0.5, 0.5, 'No Data', ha='center', va='center', fontsize=14)
-                ax.set_title(f'Confusion Matrix - {title}', fontsize=12)
-        
-        plt.tight_layout()
-        combined_path = output_dir / "confusion_matrix_combined.png"
-        plt.savefig(str(combined_path), dpi=150, bbox_inches='tight')
-        print(f"Combined confusion matrix saved: {combined_path}")
-        
-        # Show the plot
         plt.show()
         
     else:
