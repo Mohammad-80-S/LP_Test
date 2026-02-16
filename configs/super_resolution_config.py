@@ -16,7 +16,7 @@ class SuperResolutionConfig(BaseConfig):
     
     # Training dimensions - the size the model was trained on
     training_width: int = 38
-    training_height: int = 13
+    training_height: int = 12
     
     # Size threshold - apply SR only to small images
     min_width: int = 50   # If image width < this, apply SR

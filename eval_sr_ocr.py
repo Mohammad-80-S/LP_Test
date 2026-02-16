@@ -21,6 +21,16 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from matplotlib.colors import LinearSegmentedColormap
 
+try:
+    import openpyxl
+    from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+    HAS_OPENPYXL = True
+except ImportError:
+    HAS_OPENPYXL = False
+    print("Warning: openpyxl not installed. Excel export will be skipped.")
+    print("Install with: pip install openpyxl")
+
 from configs import SuperResolutionConfig, OCRConfig
 from modules.super_resolution import SuperResolutionInference
 from modules.ocr import OCRRecognizer
@@ -78,13 +88,26 @@ def normalize_characters(text: str) -> str:
     return text.replace("2", "2")
 
 
+def normalize_token(token: str) -> str:
+    """
+    Normalize a single token for comparison.
+    Treats '3' as '2'.
+    """
+    if token is None:
+        return None
+    if token == BG_TOKEN:
+        return token
+    return token.replace("2", "2")
+
+
 def normalize_tokens(tokens: list) -> list:
     """
-    Normalize tokens for comparison.
+    Normalize a list of tokens for comparison.
+    Treats '3' as '2' in each token.
     """
     if not tokens:
         return []
-    return [normalize_characters(t) for t in tokens]
+    return [normalize_token(t) for t in tokens]
 
 
 def parse_xml_to_string(xml_path: Path, class_mapping) -> str | None:
@@ -316,7 +339,10 @@ class ConfusionMatrixBuilder:
         self.total_deletions = 0
     
     def add_prediction(self, gt_tokens: list, pred_tokens: list):
-        """Add a prediction pair to the confusion matrix using token lists."""
+        """Add a prediction pair to the confusion matrix using token lists.
+        
+        IMPORTANT: Tokens should already be normalized before calling this method.
+        """
         if gt_tokens is None:
             gt_tokens = []
         if pred_tokens is None:
@@ -451,7 +477,6 @@ class ConfusionMatrixBuilder:
         # Highlight <BG> row and column with different background
         if BG_TOKEN in gt_labels:
             bg_idx = gt_labels.index(BG_TOKEN)
-            # Add a subtle highlight to the BG row and column
             ax.axhline(y=bg_idx, color='orange', linewidth=2)
             ax.axhline(y=bg_idx + 1, color='orange', linewidth=2)
             ax.axvline(x=bg_idx, color='orange', linewidth=2)
@@ -462,6 +487,290 @@ class ConfusionMatrixBuilder:
         plt.close()
         
         print(f"Confusion matrix saved: {save_path}")
+    
+    def save_to_excel(self, save_path: str):
+        """Save both count and normalized confusion matrices to an Excel file."""
+        if not HAS_OPENPYXL:
+            print(f"Warning: openpyxl not installed. Skipping Excel export for {self.name}")
+            return
+        
+        wb = openpyxl.Workbook()
+        
+        # --- Sheet 1: Count Matrix ---
+        ws_count = wb.active
+        ws_count.title = "Count"
+        matrix_count, labels_count, _ = self.build_matrix()
+        self._write_matrix_to_sheet(ws_count, matrix_count, labels_count, labels_count, 
+                                     is_normalized=False)
+        
+        # --- Sheet 2: Normalized Matrix ---
+        ws_norm = wb.create_sheet(title="Normalized")
+        matrix_norm, labels_norm, _ = self.build_normalized_matrix()
+        self._write_matrix_to_sheet(ws_norm, matrix_norm, labels_norm, labels_norm, 
+                                     is_normalized=True)
+        
+        # --- Sheet 3: Summary ---
+        ws_summary = wb.create_sheet(title="Summary")
+        self._write_summary_to_sheet(ws_summary, matrix_count, labels_count)
+        
+        wb.save(save_path)
+        print(f"Confusion matrix Excel saved: {save_path}")
+    
+    def _write_matrix_to_sheet(self, ws, matrix, gt_labels, pred_labels, is_normalized=False):
+        """Write a confusion matrix to an Excel worksheet with formatting."""
+        n = len(gt_labels)
+        
+        # Styles
+        header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+        header_font = Font(color="FFFFFF", bold=True, size=11)
+        bg_fill = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
+        bg_font = Font(bold=True, color="D35400")
+        diag_fill = PatternFill(start_color="D5F5E3", end_color="D5F5E3", fill_type="solid")
+        center_align = Alignment(horizontal="center", vertical="center")
+        thin_border = Border(
+            left=Side(style='thin'),
+            right=Side(style='thin'),
+            top=Side(style='thin'),
+            bottom=Side(style='thin')
+        )
+        
+        # Title row
+        title = f"Confusion Matrix - {self.name} ({'Normalized' if is_normalized else 'Count'})"
+        ws.cell(row=1, column=1, value=title).font = Font(bold=True, size=14)
+        ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=min(n + 3, 20))
+        
+        # Note about normalization
+        if is_normalized:
+            ws.cell(row=2, column=1, value="Note: Values are row-normalized (each row sums to 1.0)").font = Font(italic=True, size=10)
+        else:
+            ws.cell(row=2, column=1, value="Note: Values are raw counts").font = Font(italic=True, size=10)
+        
+        start_row = 4
+        
+        # Top-left corner label
+        cell = ws.cell(row=start_row, column=1, value="GT \\ Pred")
+        cell.fill = PatternFill(start_color="2C3E50", end_color="2C3E50", fill_type="solid")
+        cell.font = Font(color="FFFFFF", bold=True, size=10)
+        cell.alignment = center_align
+        cell.border = thin_border
+        
+        # Column headers (Predicted)
+        for j, pred_label in enumerate(pred_labels):
+            cell = ws.cell(row=start_row, column=j + 2, value=pred_label)
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = center_align
+            cell.border = thin_border
+            
+            if pred_label == BG_TOKEN:
+                cell.fill = PatternFill(start_color="E67E22", end_color="E67E22", fill_type="solid")
+        
+        # Row total header
+        cell = ws.cell(row=start_row, column=n + 2, value="Total")
+        cell.fill = PatternFill(start_color="2C3E50", end_color="2C3E50", fill_type="solid")
+        cell.font = Font(color="FFFFFF", bold=True, size=10)
+        cell.alignment = center_align
+        cell.border = thin_border
+        
+        # Accuracy header (only for count matrix)
+        if not is_normalized:
+            cell = ws.cell(row=start_row, column=n + 3, value="Accuracy")
+            cell.fill = PatternFill(start_color="2C3E50", end_color="2C3E50", fill_type="solid")
+            cell.font = Font(color="FFFFFF", bold=True, size=10)
+            cell.alignment = center_align
+            cell.border = thin_border
+        
+        # Matrix data
+        for i, gt_label in enumerate(gt_labels):
+            row = start_row + 1 + i
+            
+            # Row header (Ground Truth)
+            cell = ws.cell(row=row, column=1, value=gt_label)
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = center_align
+            cell.border = thin_border
+            
+            if gt_label == BG_TOKEN:
+                cell.fill = PatternFill(start_color="E67E22", end_color="E67E22", fill_type="solid")
+            
+            row_sum = 0
+            for j in range(n):
+                value = matrix[i, j]
+                cell = ws.cell(row=row, column=j + 2)
+                
+                if is_normalized:
+                    cell.value = round(float(value), 4)
+                    cell.number_format = '0.00%'
+                else:
+                    cell.value = int(value)
+                    row_sum += int(value)
+                
+                cell.alignment = center_align
+                cell.border = thin_border
+                
+                # Highlight diagonal (correct predictions)
+                if i == j:
+                    cell.fill = diag_fill
+                    cell.font = Font(bold=True)
+                
+                # Highlight <BG> row and column
+                if gt_label == BG_TOKEN or pred_labels[j] == BG_TOKEN:
+                    if i != j:  # Don't override diagonal
+                        cell.fill = bg_fill
+                
+                # Highlight errors (non-zero off-diagonal) with light red
+                if i != j and ((is_normalized and value > 0) or (not is_normalized and value > 0)):
+                    if gt_label != BG_TOKEN and pred_labels[j] != BG_TOKEN:
+                        cell.fill = PatternFill(start_color="FADBD8", end_color="FADBD8", fill_type="solid")
+            
+            # Row total
+            if not is_normalized:
+                cell = ws.cell(row=row, column=n + 2, value=row_sum)
+                cell.alignment = center_align
+                cell.border = thin_border
+                cell.font = Font(bold=True)
+                
+                # Per-row accuracy
+                correct = int(matrix[i, i])
+                acc = correct / row_sum if row_sum > 0 else 0
+                cell = ws.cell(row=row, column=n + 3)
+                cell.value = acc
+                cell.number_format = '0.00%'
+                cell.alignment = center_align
+                cell.border = thin_border
+                
+                if gt_label == BG_TOKEN:
+                    cell.value = "N/A"
+                    cell.number_format = '@'
+            else:
+                row_total = float(matrix[i, :].sum())
+                cell = ws.cell(row=row, column=n + 2, value=round(row_total, 4))
+                cell.number_format = '0.00'
+                cell.alignment = center_align
+                cell.border = thin_border
+                cell.font = Font(bold=True)
+        
+        # Column totals row (only for count matrix)
+        if not is_normalized:
+            total_row = start_row + 1 + n
+            cell = ws.cell(row=total_row, column=1, value="Total")
+            cell.fill = PatternFill(start_color="2C3E50", end_color="2C3E50", fill_type="solid")
+            cell.font = Font(color="FFFFFF", bold=True, size=10)
+            cell.alignment = center_align
+            cell.border = thin_border
+            
+            grand_total = 0
+            for j in range(n):
+                col_sum = int(matrix[:, j].sum())
+                grand_total += col_sum
+                cell = ws.cell(row=total_row, column=j + 2, value=col_sum)
+                cell.alignment = center_align
+                cell.border = thin_border
+                cell.font = Font(bold=True)
+            
+            cell = ws.cell(row=total_row, column=n + 2, value=grand_total)
+            cell.alignment = center_align
+            cell.border = thin_border
+            cell.font = Font(bold=True)
+        
+        # Auto-adjust column widths
+        for col_idx in range(1, n + 4):
+            col_letter = get_column_letter(col_idx)
+            max_length = 0
+            for row_idx in range(start_row, start_row + n + 3):
+                cell = ws.cell(row=row_idx, column=col_idx)
+                if cell.value:
+                    max_length = max(max_length, len(str(cell.value)))
+            ws.column_dimensions[col_letter].width = max(max_length + 2, 8)
+    
+    def _write_summary_to_sheet(self, ws, matrix, labels):
+        """Write summary statistics to an Excel worksheet."""
+        # Styles
+        header_font = Font(bold=True, size=12)
+        subheader_font = Font(bold=True, size=10)
+        center_align = Alignment(horizontal="center", vertical="center")
+        
+        row = 1
+        ws.cell(row=row, column=1, value=f"Summary - {self.name}").font = Font(bold=True, size=14)
+        row += 2
+        
+        # Overall statistics
+        ws.cell(row=row, column=1, value="Per-Token Accuracy").font = header_font
+        row += 1
+        
+        ws.cell(row=row, column=1, value="Token").font = subheader_font
+        ws.cell(row=row, column=2, value="Correct").font = subheader_font
+        ws.cell(row=row, column=3, value="Total").font = subheader_font
+        ws.cell(row=row, column=4, value="Accuracy").font = subheader_font
+        ws.cell(row=row, column=5, value="Main Confusions").font = subheader_font
+        row += 1
+        
+        total_correct = 0
+        total_count = 0
+        
+        for i, gt_token in enumerate(labels):
+            row_sum = int(matrix[i, :].sum())
+            if row_sum > 0:
+                correct = int(matrix[i, i])
+                accuracy = correct / row_sum
+                
+                if gt_token != BG_TOKEN:
+                    total_correct += correct
+                    total_count += row_sum
+                
+                # Find confusions
+                confusions = []
+                for j, pred_token in enumerate(labels):
+                    if i != j and matrix[i, j] > 0:
+                        confusions.append(f"{pred_token}:{int(matrix[i, j])}")
+                
+                ws.cell(row=row, column=1, value=gt_token)
+                ws.cell(row=row, column=2, value=correct)
+                ws.cell(row=row, column=3, value=row_sum)
+                
+                if gt_token == BG_TOKEN:
+                    ws.cell(row=row, column=4, value="N/A")
+                else:
+                    cell = ws.cell(row=row, column=4, value=accuracy)
+                    cell.number_format = '0.00%'
+                
+                ws.cell(row=row, column=5, value=", ".join(confusions) if confusions else "-")
+                row += 1
+        
+        # Overall row
+        row += 1
+        ws.cell(row=row, column=1, value="Overall (excl. BG)").font = Font(bold=True)
+        ws.cell(row=row, column=2, value=total_correct).font = Font(bold=True)
+        ws.cell(row=row, column=3, value=total_count).font = Font(bold=True)
+        if total_count > 0:
+            cell = ws.cell(row=row, column=4, value=total_correct / total_count)
+            cell.number_format = '0.00%'
+            cell.font = Font(bold=True)
+        
+        # Background statistics
+        row += 2
+        ws.cell(row=row, column=1, value="Background Statistics").font = header_font
+        row += 1
+        
+        if BG_TOKEN in labels:
+            bg_idx = labels.index(BG_TOKEN)
+            
+            deletions = sum(int(matrix[i, bg_idx]) for i in range(len(labels)) if i != bg_idx)
+            insertions = sum(int(matrix[bg_idx, j]) for j in range(len(labels)) if j != bg_idx)
+            
+            ws.cell(row=row, column=1, value="Deletions (char → background)")
+            ws.cell(row=row, column=2, value=deletions)
+            row += 1
+            ws.cell(row=row, column=1, value="Insertions (background → char)")
+            ws.cell(row=row, column=2, value=insertions)
+        else:
+            ws.cell(row=row, column=1, value="No background errors recorded")
+        
+        # Auto-adjust column widths
+        for col_idx in range(1, 6):
+            col_letter = get_column_letter(col_idx)
+            ws.column_dimensions[col_letter].width = 20
     
     def print_summary(self):
         """Print summary statistics from confusion matrix."""
@@ -481,7 +790,6 @@ class ConfusionMatrixBuilder:
         for i, gt_token in enumerate(labels):
             row_sum = matrix[i, :].sum()
             if row_sum > 0:
-                # Correct predictions are on the diagonal
                 correct = matrix[i, i]
                 accuracy = correct / row_sum * 100
                 
@@ -510,10 +818,7 @@ class ConfusionMatrixBuilder:
         if BG_TOKEN in labels:
             bg_idx = labels.index(BG_TOKEN)
             
-            # Deletions: characters predicted as background (column <BG>, excluding row <BG>)
             deletions = sum(matrix[i, bg_idx] for i in range(len(labels)) if i != bg_idx)
-            
-            # Insertions: background predicted as characters (row <BG>, excluding column <BG>)
             insertions = sum(matrix[bg_idx, j] for j in range(len(labels)) if j != bg_idx)
             
             print(f"\n  Background Statistics:")
@@ -524,11 +829,6 @@ class ConfusionMatrixBuilder:
 def plot_combined_matrices(cms: list, output_dir: Path, normalized: bool = False):
     """
     Plot combined confusion matrices for all methods in a single figure.
-    
-    Args:
-        cms: List of tuples (ConfusionMatrixBuilder, title)
-        output_dir: Directory to save the output
-        normalized: If True, plot normalized matrices
     """
     n_matrices = len(cms)
     fig, axes = plt.subplots(1, n_matrices, figsize=(10 * n_matrices, 10))
@@ -536,7 +836,6 @@ def plot_combined_matrices(cms: list, output_dir: Path, normalized: bool = False
     if n_matrices == 1:
         axes = [axes]
     
-    # Use custom white-green colormap
     cmap = create_white_green_cmap()
     
     for idx, (cm, title) in enumerate(cms):
@@ -759,10 +1058,16 @@ def main():
         bicubic_pred_normalized = normalize_characters(bicubic_pred)
         sr_pred_normalized = normalize_characters(sr_pred)
 
-        # --- Add to confusion matrices (using tokens) ---
-        cm_hr.add_prediction(gt_tokens, hr_pred_tokens)
-        cm_bicubic.add_prediction(gt_tokens, bicubic_pred_tokens)
-        cm_sr.add_prediction(gt_tokens, sr_pred_tokens)
+        # --- Normalize tokens for confusion matrix (3 -> 2) ---
+        gt_tokens_normalized = normalize_tokens(gt_tokens)
+        hr_pred_tokens_normalized = normalize_tokens(hr_pred_tokens)
+        bicubic_pred_tokens_normalized = normalize_tokens(bicubic_pred_tokens)
+        sr_pred_tokens_normalized = normalize_tokens(sr_pred_tokens)
+
+        # --- Add NORMALIZED tokens to confusion matrices ---
+        cm_hr.add_prediction(gt_tokens_normalized, hr_pred_tokens_normalized)
+        cm_bicubic.add_prediction(gt_tokens_normalized, bicubic_pred_tokens_normalized)
+        cm_sr.add_prediction(gt_tokens_normalized, sr_pred_tokens_normalized)
 
         # --- Calculate accuracies using normalized strings ---
         bicubic_acc = calculate_character_accuracy(gt_string_normalized, bicubic_pred_normalized)
@@ -777,14 +1082,14 @@ def main():
 
         print("-" * 60)
         print(f"Image: {image_filename}")
-        print(f"  GT:         {gt_string} -> tokens: {gt_tokens}")
-        print(f"  HR_Image:   {hr_pred} -> tokens: {hr_pred_tokens}  (acc={hr_acc:.2%})")
-        print(f"  Bicubic:    {bicubic_pred} -> tokens: {bicubic_pred_tokens}  (acc={bicubic_acc:.2%})")
-        print(f"  SR model:   {sr_pred} -> tokens: {sr_pred_tokens}  (acc={sr_acc:.2%})")
+        print(f"  GT:         {gt_string} -> tokens: {gt_tokens} -> normalized: {gt_tokens_normalized}")
+        print(f"  HR_Image:   {hr_pred} -> tokens: {hr_pred_tokens} -> normalized: {hr_pred_tokens_normalized}  (acc={hr_acc:.2%})")
+        print(f"  Bicubic:    {bicubic_pred} -> tokens: {bicubic_pred_tokens} -> normalized: {bicubic_pred_tokens_normalized}  (acc={bicubic_acc:.2%})")
+        print(f"  SR model:   {sr_pred} -> tokens: {sr_pred_tokens} -> normalized: {sr_pred_tokens_normalized}  (acc={sr_acc:.2%})")
         
         # Show detailed alignment if requested or if there are errors
         if args.show_alignment or (sr_acc < 0.99 and sr_acc > 0):
-            print_alignment_details(gt_tokens, sr_pred_tokens, "SR model")
+            print_alignment_details(gt_tokens_normalized, sr_pred_tokens_normalized, "SR model (normalized)")
 
     # --- Final summary ---
     if bicubic_accuracies:
@@ -795,7 +1100,7 @@ def main():
         print("\n" + "=" * 60)
         print("EVALUATION COMPLETE")
         print("=" * 60)
-        print("Note: Characters '3' treated as '2' for accuracy calculation")
+        print("Note: Characters '3' treated as '2' for accuracy and confusion matrix")
         print(f"Images evaluated: {len(bicubic_accuracies)}")
         print(f"Average char accuracy (HR): {avg_hr:.2%}")
         print(f"Average char accuracy (Bicubic): {avg_bicubic:.2%}")
@@ -820,6 +1125,7 @@ def main():
             str(output_dir / "confusion_matrix_hr_normalized.png"), 
             normalized=True
         )
+        cm_hr.save_to_excel(str(output_dir / "confusion_matrix_hr.xlsx"))
         
         # Bicubic matrices
         cm_bicubic.plot_and_save(
@@ -830,6 +1136,7 @@ def main():
             str(output_dir / "confusion_matrix_bicubic_normalized.png"), 
             normalized=True
         )
+        cm_bicubic.save_to_excel(str(output_dir / "confusion_matrix_bicubic.xlsx"))
         
         # SR matrices
         cm_sr.plot_and_save(
@@ -840,6 +1147,7 @@ def main():
             str(output_dir / "confusion_matrix_sr_normalized.png"), 
             normalized=True
         )
+        cm_sr.save_to_excel(str(output_dir / "confusion_matrix_sr.xlsx"))
         
         # Print per-token summaries
         cm_hr.print_summary()
@@ -863,7 +1171,7 @@ def main():
         # Combined normalized matrix
         fig_normalized = plot_combined_matrices(cms_list, output_dir, normalized=True)
         
-        # Display the plots
+        # Display
         print("\n" + "=" * 60)
         print("DISPLAYING CONFUSION MATRICES")
         print("=" * 60)

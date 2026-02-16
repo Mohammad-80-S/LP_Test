@@ -12,7 +12,7 @@ class OCRConfig(BaseConfig):
     output_subdir: str = "05_ocr"
     
     # Character limit - stop after this many characters from left
-    max_characters: int = 8
+    max_characters: int = 9
     limit_characters: bool = True  # Enable/disable character limiting
     
     # Class mapping for Persian license plates
